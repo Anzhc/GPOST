@@ -3,7 +3,7 @@
 This is a tool that allows you to automatically detect, translate and overlay translation right on top of the original text bodies.  
 
 ![изображение](https://github.com/user-attachments/assets/9b3d0e90-7841-447d-92c9-ffaf367e8bf3)
-
+(Currently text handling is very basic, and often having hard tome conforming to polygon areas)
 ## Installation  
 1. Navigate to folder you want to install GPOST to
 2. Open CMD or Powershell
