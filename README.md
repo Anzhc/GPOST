@@ -1,6 +1,6 @@
 # GPOST
 ## General Purpose On-Screen Translator  
-This is a tool that allows you to automatically detect, translate and overlay translation right on top of the original text bodies.  
+This is a tool that allows you to automatically detect, translate and overlay translation right on top of the original text bodies in a matter of seconds, as well as read them with TTS.  
 ATTENTION: Requires Gemini API key.
 ![изображение](https://github.com/user-attachments/assets/9b3d0e90-7841-447d-92c9-ffaf367e8bf3)
 (Currently text handling is very basic, and often having hard tome conforming to polygon areas)
