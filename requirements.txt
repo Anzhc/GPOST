@@ -1,0 +1,15 @@
+mss
+numpy
+ultralytics
+PyQt6
+shapely
+keyboard
+pywin32
+huggingface_hub
+google-api-core
+google-genai
+pillow
+elevenlabs
+sounddevice
+miniaudio
+pyaudio

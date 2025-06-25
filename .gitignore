@@ -1,0 +1,16 @@
+*.txt
+*.pt
+__pycache__/
+*.zip
+!requirements.txt
+*TTS
+*Translation Project/models
+*.json
+*.safetensors
+*.log
+*.jpg
+*.png
+*.jpeg
+*.webp
+*.wav
+*venv
