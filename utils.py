@@ -1,4 +1,6 @@
 import os
+import datetime
+import threading
 import mss
 import numpy as np
 import tempfile
@@ -12,6 +14,85 @@ def read_api_key_from_file():
         with open(path, "r", encoding="utf-8") as f:
             return f.read().strip()
     return ""
+
+
+def read_openai_key_from_file():
+    """Return OpenAI API key from OPENAI_API_KEY or openai_api_key.txt if present."""
+    env_key = os.getenv("OPENAI_API_KEY", "").strip()
+    if env_key:
+        return env_key
+    path = os.path.join(os.path.dirname(__file__), "openai_api_key.txt")
+    if os.path.isfile(path):
+        with open(path, "r", encoding="utf-8") as f:
+            return f.read().strip()
+    return ""
+
+
+_DEBUG_LOG_ENABLED = False
+_DEBUG_LOG_PATH = os.path.join(os.path.dirname(__file__), "debug_log.txt")
+_DEBUG_LOG_LOCK = threading.Lock()
+
+
+def set_debug_logging(enabled: bool, path: str | None = None):
+    """Enable/disable debug logging and optionally set a custom path."""
+    global _DEBUG_LOG_ENABLED, _DEBUG_LOG_PATH
+    _DEBUG_LOG_ENABLED = bool(enabled)
+    if path:
+        _DEBUG_LOG_PATH = path
+
+
+def debug_log(message: str):
+    """Write a timestamped line to the debug log when enabled."""
+    if not _DEBUG_LOG_ENABLED:
+        return
+    ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+    line = f"{ts} | {message}\n"
+    with _DEBUG_LOG_LOCK:
+        with open(_DEBUG_LOG_PATH, "a", encoding="utf-8") as f:
+            f.write(line)
+
+
+def prepare_image_for_api(path: str, max_dim: int = 640, jpeg_quality: int = 70):
+    """Return a resized/compressed image path and info for faster API calls."""
+    info = {
+        "orig_size": None,
+        "new_size": None,
+        "scale": None,
+        "format": None,
+    }
+    try:
+        img = Image.open(path)
+        orig_w, orig_h = img.size
+        info["orig_size"] = (orig_w, orig_h)
+        scale = min(1.0, max_dim / float(max(orig_w, orig_h)))
+        info["scale"] = scale
+        if scale < 1.0:
+            new_w = max(1, int(orig_w * scale))
+            new_h = max(1, int(orig_h * scale))
+            img = img.resize((new_w, new_h), Image.LANCZOS)
+        else:
+            new_w, new_h = orig_w, orig_h
+        info["new_size"] = (new_w, new_h)
+
+        has_alpha = img.mode in ("RGBA", "LA") or (
+            img.mode == "P" and "transparency" in img.info
+        )
+        if has_alpha:
+            bg = Image.new("RGB", img.size, (255, 255, 255))
+            alpha = img.split()[-1]
+            bg.paste(img, mask=alpha)
+            img = bg
+        else:
+            img = img.convert("RGB")
+
+        tf = tempfile.NamedTemporaryFile(delete=False, suffix=".jpg")
+        img.save(tf, "JPEG", quality=jpeg_quality, optimize=True)
+        tf.close()
+        info["format"] = "jpg"
+        return tf.name, info
+    except Exception as e:
+        debug_log(f"prepare_image_for_api error={e}")
+        return path, info
 
 
 def read_11_labs_key_from_file():

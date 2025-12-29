@@ -1,4 +1,5 @@
 *.txt
+debug_log.txt
 *.pt
 __pycache__/
 *.zip
