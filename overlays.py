@@ -267,3 +267,77 @@ class GradientOverlay(QWidget):
         painter.drawPixmap(0, 0, self.gradient_pix)
         painter.end()
 
+
+class AutoAreaOverlay(QWidget):
+    """Overlay that faintly outlines the auto-detected area on a monitor.
+
+    Geometry is the full monitor logical rect; `rect_phys_rel` is a dict with
+    device-physical coordinates relative to the monitor's top-left.
+    """
+
+    def __init__(self, monitor_logical, parent=None):
+        super().__init__(parent)
+        self.monitor_logical = monitor_logical
+        self.dpr = monitor_logical["dpr"]
+        self.rect_phys_rel = None
+        self.suppressed = False
+
+        self.setWindowFlags(
+            Qt.WindowType.FramelessWindowHint
+            | Qt.WindowType.WindowStaysOnTopHint
+            | Qt.WindowType.Tool
+        )
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground)
+
+        self.setGeometry(
+            monitor_logical["left"],
+            monitor_logical["top"],
+            monitor_logical["width"],
+            monitor_logical["height"],
+        )
+        self.make_window_click_through()
+        self.show()
+        print("[AutoAreaOverlay] Created at", monitor_logical)
+
+    def make_window_click_through(self):
+        hwnd = self.winId().__int__()
+        ex_style = win32gui.GetWindowLong(hwnd, win32con.GWL_EXSTYLE)
+        ex_style |= win32con.WS_EX_LAYERED | win32con.WS_EX_TRANSPARENT
+        win32gui.SetWindowLong(hwnd, win32con.GWL_EXSTYLE, ex_style)
+        # Exclude this window from screen capture to avoid interfering with detection.
+        try:
+            # 0x11 == WDA_EXCLUDEFROMCAPTURE
+            win32gui.SetWindowDisplayAffinity(hwnd, 0x11)
+        except Exception:
+            try:
+                import ctypes
+                ctypes.windll.user32.SetWindowDisplayAffinity(hwnd, 0x11)
+            except Exception:
+                pass
+
+    def set_rect(self, rect_phys_rel):
+        self.rect_phys_rel = rect_phys_rel
+        self.update()
+
+    def set_suppressed(self, suppressed: bool):
+        self.suppressed = bool(suppressed)
+        self.update()
+
+    def paintEvent(self, _):
+        if self.suppressed or not self.rect_phys_rel:
+            return
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        # Faint red border
+        pen = QPen(QColor(255, 0, 0, 120))
+        pen.setWidth(2)
+        painter.setPen(pen)
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+
+        x = int(self.rect_phys_rel['left'] / self.dpr)
+        y = int(self.rect_phys_rel['top'] / self.dpr)
+        w = int(self.rect_phys_rel['width'] / self.dpr)
+        h = int(self.rect_phys_rel['height'] / self.dpr)
+        painter.drawRect(x, y, w, h)
+        painter.end()

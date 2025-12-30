@@ -23,9 +23,10 @@ def read_11_labs_key_from_file():
     return ""
 
 
-def capture_screenshot(sct, region_phys):
+def capture_screenshot(sct, region_phys, quiet=False):
     """Grab screen region using mss."""
-    print("[capture_screenshot] region_phys =", region_phys)
+    if not quiet:
+        print("[capture_screenshot] region_phys =", region_phys)
     return sct.grab(region_phys)
 
 
@@ -36,7 +37,7 @@ def screenshot_to_array(sshot):
     return img
 
 
-def parse_yolo_results(results_list, capture_w, capture_h):
+def parse_yolo_results(results_list, capture_w, capture_h, quiet=False):
     """Return list of bbox/polygon detections in physical coordinates."""
     output_raw = []
     polygon_indices = set()
@@ -77,7 +78,8 @@ def parse_yolo_results(results_list, capture_w, capture_h):
                 })
 
     final_list = [item for item in output_raw if not (item["type"] == "bbox" and item["det_index"] in polygon_indices)]
-    print("[parse_yolo_results] Found", len(final_list), "detections after polygon filtering.")
+    if not quiet:
+        print("[parse_yolo_results] Found", len(final_list), "detections after polygon filtering.")
     return final_list
 
 

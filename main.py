@@ -12,7 +12,7 @@ from PyQt6.QtWidgets import (
     QGroupBox, QSpinBox, QCheckBox, QSlider, QScrollArea,
     QPlainTextEdit, QSplitter, QInputDialog, QLineEdit
 )
-from PyQt6.QtCore import Qt, QTimer, pyqtSignal, pyqtSlot, QPoint
+from PyQt6.QtCore import Qt, QTimer, pyqtSignal, pyqtSlot, QPoint, QThread
 from PyQt6.QtGui import QGuiApplication
 
 from utils import (
@@ -24,6 +24,7 @@ from utils import (
 )
 from model_helper import prepare_latest_model
 from overlays import DetectionOverlay, RegionSelectOverlay, GradientOverlay
+from overlays import AutoAreaOverlay
 from translation_overlay import TranslationOverlay
 from translation_threads import (
     GEMINI_AVAILABLE,
@@ -31,6 +32,7 @@ from translation_threads import (
     GeminiBatchTranslationThread,
     ElevenLabsTTSThread,
     GeminiTTSThread,
+    ChatterboxTTSThread,
 )
 
 try:
@@ -46,6 +48,70 @@ try:
 except Exception:
     Polygon = None
     SHAPELY_AVAILABLE = False
+
+
+class AutoAreaWorker(QThread):
+    area_rect_ready = pyqtSignal(dict)
+    pre_capture = pyqtSignal()
+    post_capture = pyqtSignal()
+
+    def __init__(self, area_model, monitor_dict, parent=None):
+        super().__init__(parent)
+        self.area_model = area_model
+        self.monitor = dict(monitor_dict) if monitor_dict else None
+        self._running = True
+
+    @pyqtSlot(dict)
+    def update_monitor(self, mon):
+        self.monitor = dict(mon) if mon else None
+
+    def stop(self):
+        self._running = False
+
+    def run(self):
+        if self.area_model is None:
+            return
+        import mss as _mss
+        from utils import capture_screenshot, screenshot_to_array, parse_yolo_results
+        while self._running:
+            if not self.monitor:
+                self.msleep(100)
+                continue
+            try:
+                self.pre_capture.emit()
+                # small pause to allow UI to repaint overlay suppressed
+                self.msleep(5)
+                with _mss.mss() as sct:
+                    sshot = capture_screenshot(sct, self.monitor, quiet=True)
+                img = screenshot_to_array(sshot)
+                h, w = img.shape[0], img.shape[1]
+                # suppress Ultralytics logs
+                results = self.area_model(img, conf=0.25, iou=0.5, verbose=False)
+                dets = parse_yolo_results(results, w, h, quiet=True)
+                if dets:
+                    # choose largest bbox (or bbox of polygon)
+                    def det_bbox(det):
+                        if det['type'] == 'bbox':
+                            return det['coords']
+                        xs = [p[0] for p in det['coords']]
+                        ys = [p[1] for p in det['coords']]
+                        return (min(xs), min(ys), max(xs), max(ys))
+                    def area_of(b):
+                        return max(0, b[2]-b[0]) * max(0, b[3]-b[1])
+                    best = max(dets, key=lambda d: area_of(det_bbox(d)))
+                    x1, y1, x2, y2 = det_bbox(best)
+                    rect_abs = {
+                        'left': self.monitor['left'] + int(x1),
+                        'top': self.monitor['top'] + int(y1),
+                        'width': int(x2 - x1),
+                        'height': int(y2 - y1),
+                    }
+                    self.area_rect_ready.emit(rect_abs)
+            except Exception as e:
+                print('[auto-area-worker] error:', e)
+            finally:
+                self.post_capture.emit()
+                self.msleep(250)
 
 
 class MainWindow(QMainWindow):
@@ -64,6 +130,7 @@ class MainWindow(QMainWindow):
         self.screenshot_rgb = None
         self.last_detections = []
         self.model = None
+        self.area_model = None
 
         self.detection_overlay = None
         self.translation_overlay = None
@@ -72,6 +139,9 @@ class MainWindow(QMainWindow):
         self.tts_threads = []
         self.eleven_api_key = ""
         self.region_select_overlay = None
+        self.auto_area_overlay = None
+        self.auto_area_device_rect = None  # last predicted area in device coords
+        self.auto_area_monitor_index = 0
 
         self.current_keys_pressed = set()
         self.console_lines = []
@@ -98,6 +168,9 @@ class MainWindow(QMainWindow):
         self.close_timer = QTimer(self)
         self.close_timer.timeout.connect(self.periodic_check)
         self.close_timer.start(200)
+
+        # Auto area background worker (started when enabled)
+        self.auto_area_thread = None
 
         if KEYBOARD_AVAILABLE:
             self.register_global_hotkeys()
@@ -170,6 +243,16 @@ class MainWindow(QMainWindow):
         hl.addWidget(self.btn_sel_area)
         left.addLayout(hl)
 
+        # Automatic Area controls
+        auto_row = QHBoxLayout()
+        self.auto_area_check = QCheckBox("Automatic Area")
+        self.auto_area_check.stateChanged.connect(self.on_auto_area_toggle)
+        auto_row.addWidget(self.auto_area_check)
+        self.btn_load_area_model = QPushButton("Load Area YOLO Model")
+        self.btn_load_area_model.clicked.connect(self.on_load_area_model)
+        auto_row.addWidget(self.btn_load_area_model)
+        left.addLayout(auto_row)
+
         self.btn_load_model = QPushButton("Load YOLO Model")
         self.btn_load_model.clicked.connect(self.on_load_model)
         left.addWidget(self.btn_load_model)
@@ -200,7 +283,11 @@ class MainWindow(QMainWindow):
 
         self.model_combo = QComboBox()
         self.model_combo.addItems([
-            "gemini-2.5-flash-preview-04-17",
+            "gemini-3-flash-preview",
+            "gemini-2.5-flash-preview-09-2025",
+            "gemini-2.5-flash",
+            "gemini-2.5-flash-lite",
+            "gemini-2.5-flash-lite-preview-09-2025",
             "gemini-2.5-pro-preview-03-25",
             "gemini-2.0-flash",
             "gemini-2.0-flash-lite",
@@ -307,6 +394,15 @@ class MainWindow(QMainWindow):
         self.gemini_instruction_edit.setEnabled(False)
         right.addWidget(self.gemini_instruction_edit)
 
+        self.chatterbox_tts_check = QCheckBox("Queue TTS (Chatterbox)")
+        self.chatterbox_tts_check.stateChanged.connect(self.on_chatterbox_tts_toggle)
+        right.addWidget(self.chatterbox_tts_check)
+
+        self.chatterbox_voice_combo = QComboBox()
+        self.chatterbox_voice_combo.setEnabled(False)
+        self._populate_chatterbox_voices()
+        right.addWidget(self.chatterbox_voice_combo)
+
         self.tts_check = QCheckBox("Queue TTS (11Labs)")
         self.tts_check.stateChanged.connect(self.on_tts_toggle)
         right.addWidget(self.tts_check)
@@ -317,6 +413,7 @@ class MainWindow(QMainWindow):
         right.addWidget(self.voice_id_edit)
 
         self.class_checkboxes = {}
+        self.monitor_combo.currentIndexChanged.connect(self.on_monitor_changed)
 
     # ------------------------------------------------------------------
     def register_global_hotkeys(self):
@@ -367,6 +464,15 @@ class MainWindow(QMainWindow):
             thr.deleteLater()
         self.tts_threads.clear()
 
+    def _current_monitor(self):
+        idx = self.monitor_combo.currentIndex()
+        if idx < 0 or idx >= len(self.monitors):
+            return None, -1
+        return self.monitors[idx], idx
+
+    def _monitor_logical_rect(self, mon):
+        return self._make_logical_rect(mon)
+
     def _log_console(self, text):
         if not self.console_edit:
             return
@@ -382,9 +488,35 @@ class MainWindow(QMainWindow):
         if len(self.translation_history) > 1000:
             self.translation_history = self.translation_history[-1000:]
 
+    def _populate_chatterbox_voices(self):
+        if not hasattr(self, 'chatterbox_voice_combo'):
+            return
+        current_data = None
+        if self.chatterbox_voice_combo.count():
+            current_data = self.chatterbox_voice_combo.currentData()
+        self.chatterbox_voice_combo.blockSignals(True)
+        self.chatterbox_voice_combo.clear()
+        self.chatterbox_voice_combo.addItem('Model default voice', '')
+        voice_dir = os.path.join(os.path.dirname(__file__), 'voicebank')
+        if os.path.isdir(voice_dir):
+            for name in sorted(os.listdir(voice_dir)):
+                if name.lower().endswith('.wav'):
+                    self.chatterbox_voice_combo.addItem(name, os.path.join(voice_dir, name))
+        if current_data:
+            idx = self.chatterbox_voice_combo.findData(current_data)
+            if idx >= 0:
+                self.chatterbox_voice_combo.setCurrentIndex(idx)
+            else:
+                self.chatterbox_voice_combo.setCurrentIndex(0)
+        else:
+            self.chatterbox_voice_combo.setCurrentIndex(0)
+        self.chatterbox_voice_combo.blockSignals(False)
+
     def _start_tts(self, lines: list[str]):
         if not lines:
             return
+
+        lines = [line.replace('-', '—') if isinstance(line, str) else line for line in lines]
 
         for thr in self.tts_threads:
             thr.stop()
@@ -410,6 +542,12 @@ class MainWindow(QMainWindow):
                 self.tts_threads.append(thr)
             else:
                 self.gemini_tts_check.setChecked(False)
+
+        if getattr(self, 'chatterbox_tts_check', None) and self.chatterbox_tts_check.isChecked():
+            voice_path = self.chatterbox_voice_combo.currentData()
+            thr = ChatterboxTTSThread(lines, voice_path=voice_path or None)
+            thr.start()
+            self.tts_threads.append(thr)
 
         if self.tts_check.isChecked():
             if not self._check_11labs_key():
@@ -528,6 +666,59 @@ class MainWindow(QMainWindow):
             'height': int(r_phys['height'] / dpr),
             'dpr': dpr
         }
+
+    def _ensure_auto_area_overlay(self):
+        if not self.auto_area_check.isChecked():
+            return
+        mon, idx = self._current_monitor()
+        if not mon:
+            return
+        mon_logical = self._monitor_logical_rect(mon)
+        # Recreate if monitor changed or overlay missing
+        if (self.auto_area_overlay is None) or (self.auto_area_monitor_index != idx):
+            if self.auto_area_overlay:
+                try:
+                    self.auto_area_overlay.close()
+                except Exception:
+                    pass
+                self.auto_area_overlay = None
+            self.auto_area_overlay = AutoAreaOverlay(mon_logical)
+            self.auto_area_monitor_index = idx
+        # Push the latest rect
+        if self.auto_area_device_rect:
+            # Convert absolute device rect to monitor-relative
+            rel_left = self.auto_area_device_rect['left'] - mon['left']
+            rel_top = self.auto_area_device_rect['top'] - mon['top']
+            rect_rel = {
+                'left': rel_left,
+                'top': rel_top,
+                'width': self.auto_area_device_rect['width'],
+                'height': self.auto_area_device_rect['height'],
+            }
+            self.auto_area_overlay.set_rect(rect_rel)
+
+    def _start_auto_area_worker(self):
+        if not (self.auto_area_check.isChecked() and self.area_model is not None):
+            return
+        mon, _ = self._current_monitor()
+        if not mon:
+            return
+        if self.auto_area_thread and self.auto_area_thread.isRunning():
+            # update only monitor
+            self.auto_area_thread.update_monitor(mon)
+            return
+        self.auto_area_thread = AutoAreaWorker(self.area_model, mon)
+        self.auto_area_thread.area_rect_ready.connect(self._on_auto_area_result)
+        self.auto_area_thread.start()
+
+    def _stop_auto_area_worker(self):
+        if self.auto_area_thread:
+            try:
+                self.auto_area_thread.stop()
+                self.auto_area_thread.wait(300)
+            except Exception:
+                pass
+            self.auto_area_thread = None
 
     # ------------------------------------------------------------------
     def postProcessMergeByArea(self, detections, overlap_threshold=0.6, use_alt_merge=False):
@@ -692,9 +883,60 @@ class MainWindow(QMainWindow):
                 self.populate_class_checkboxes(class_names)
 
     @pyqtSlot()
+    def on_load_area_model(self):
+        dlg = QFileDialog(self, 'Select Area YOLO Model')
+        dlg.setNameFilter('YOLO model files (*.pt *.onnx *.pth)')
+        if dlg.exec():
+            chosen = dlg.selectedFiles()
+            if chosen:
+                mp = chosen[0]
+                print('[on_load_area_model] Loading Area YOLO =>', mp)
+                try:
+                    self.area_model = YOLO(mp)
+                    print('[on_load_area_model] Area model loaded.')
+                    if self.auto_area_check.isChecked():
+                        self._start_auto_area_worker()
+                except Exception as e:
+                    print('[on_load_area_model] Failed to load area model:', e)
+
+    @pyqtSlot(int)
+    def on_auto_area_toggle(self, _):
+        if not self.auto_area_check.isChecked():
+            if self.auto_area_overlay:
+                try:
+                    self.auto_area_overlay.close()
+                except Exception:
+                    pass
+                self.auto_area_overlay = None
+            self._stop_auto_area_worker()
+            return
+        # Ensure overlay shows up immediately
+        self._ensure_auto_area_overlay()
+        self._start_auto_area_worker()
+
+    @pyqtSlot(int)
+    def on_monitor_changed(self, _):
+        # Rebuild overlay to new monitor if needed
+        if self.auto_area_check.isChecked():
+            self._ensure_auto_area_overlay()
+            # inform worker
+            if self.auto_area_thread and self.auto_area_thread.isRunning():
+                mon, _ = self._current_monitor()
+                if mon:
+                    self.auto_area_thread.update_monitor(mon)
+
+    @pyqtSlot()
     def on_run_inference(self):
+        # If auto-area is enabled, use the latest/next predicted area as region
+        if self.auto_area_check.isChecked() and self.area_model is not None:
+            if not self.auto_area_device_rect:
+                # Run a quick one-shot area inference to seed the region
+                self._run_area_inference_once()
+            if self.auto_area_device_rect:
+                self.region_device = dict(self.auto_area_device_rect)
+                self.region_logical = self._make_logical_rect(self.region_device)
         if not self.region_device:
-            QMessageBox.warning(self, 'No region', 'Select a monitor or sub-area first.')
+            QMessageBox.warning(self, 'No region', 'Select a monitor/sub-area or enable Automatic Area.')
             return
         self.close_overlays()
         with mss.mss() as sct:
@@ -734,6 +976,65 @@ class MainWindow(QMainWindow):
         self.detection_overlay = DetectionOverlay(self.region_logical, w, h)
         self.detection_overlay.detections = self.last_detections
         self.detection_overlay.update()
+
+    def _run_area_inference_once(self):
+        mon, _ = self._current_monitor()
+        if not mon:
+            return
+        with mss.mss() as sct:
+            sshot = capture_screenshot(sct, mon, quiet=True)
+        img = screenshot_to_array(sshot)
+        try:
+            results = self.area_model(img, conf=0.25, iou=0.5, verbose=False)
+        except Exception as e:
+            print('[auto-area] inference error:', e)
+            return
+        w, h = img.shape[1], img.shape[0]
+        dets = parse_yolo_results(results, w, h, quiet=True)
+        if not dets:
+            return
+        # Choose the largest bbox (or bbox of polygon)
+        def det_bbox(det):
+            if det['type'] == 'bbox':
+                return det['coords']
+            xs = [p[0] for p in det['coords']]
+            ys = [p[1] for p in det['coords']]
+            return (min(xs), min(ys), max(xs), max(ys))
+        def area_of(b):
+            return max(0, b[2]-b[0]) * max(0, b[3]-b[1])
+        best = max(dets, key=lambda d: area_of(det_bbox(d)))
+        x1, y1, x2, y2 = det_bbox(best)
+        # Save absolute device rect
+        self.auto_area_device_rect = {
+            'left': mon['left'] + int(x1),
+            'top': mon['top'] + int(y1),
+            'width': int(x2 - x1),
+            'height': int(y2 - y1),
+        }
+        self._ensure_auto_area_overlay()
+
+    @pyqtSlot()
+    def _on_auto_pre_capture(self):
+        if self.auto_area_overlay:
+            try:
+                self.auto_area_overlay.set_suppressed(True)
+                self.auto_area_overlay.repaint()
+            except Exception:
+                pass
+
+    @pyqtSlot()
+    def _on_auto_post_capture(self):
+        if self.auto_area_overlay:
+            try:
+                self.auto_area_overlay.set_suppressed(False)
+                self.auto_area_overlay.repaint()
+            except Exception:
+                pass
+
+    @pyqtSlot(dict)
+    def _on_auto_area_result(self, rect_abs):
+        self.auto_area_device_rect = dict(rect_abs)
+        self._ensure_auto_area_overlay()
 
     @pyqtSlot()
     def on_translate(self):
@@ -900,9 +1201,19 @@ class MainWindow(QMainWindow):
         if self.translation_overlay:
             self.translation_overlay.close()
             self.translation_overlay = None
+        # Intentionally do NOT close auto_area_overlay here. It is independent.
 
     def periodic_check(self):
         pass
+
+    # removed: timer-based auto area tick (replaced by worker thread)
+
+    @pyqtSlot(int)
+    def on_chatterbox_tts_toggle(self, _):
+        enabled = self.chatterbox_tts_check.isChecked()
+        self.chatterbox_voice_combo.setEnabled(enabled)
+        if enabled:
+            self._populate_chatterbox_voices()
 
     @pyqtSlot(int)
     def on_tts_toggle(self, _):
@@ -968,9 +1279,16 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event):
         print('[MainWindow] closeEvent => stopping threads and overlays.')
         self.close_overlays()
+        self._stop_auto_area_worker()
         if self.region_select_overlay:
             self.region_select_overlay.close()
             self.region_select_overlay = None
+        if self.auto_area_overlay:
+            try:
+                self.auto_area_overlay.close()
+            except Exception:
+                pass
+            self.auto_area_overlay = None
         event.accept()
 
 
