@@ -1,6 +1,7 @@
 import sys
 import math
 import os
+import time
 import mss
 import numpy as np
 from ultralytics import YOLO
@@ -14,13 +15,17 @@ from PyQt6.QtWidgets import (
 )
 from PyQt6.QtCore import Qt, QTimer, pyqtSignal, pyqtSlot, QPoint, QThread
 from PyQt6.QtGui import QGuiApplication
+from PIL import Image
 
 from utils import (
     read_api_key_from_file,
+    read_openai_key_from_file,
     read_11_labs_key_from_file,
     capture_screenshot,
     screenshot_to_array,
     parse_yolo_results,
+    set_debug_logging,
+    debug_log,
 )
 from model_helper import prepare_latest_model
 from overlays import DetectionOverlay, RegionSelectOverlay, GradientOverlay
@@ -28,8 +33,11 @@ from overlays import AutoAreaOverlay
 from translation_overlay import TranslationOverlay
 from translation_threads import (
     GEMINI_AVAILABLE,
+    OPENAI_AVAILABLE,
     GeminiTranslationThread,
     GeminiBatchTranslationThread,
+    OpenAITranslationThread,
+    OpenAIBatchTranslationThread,
     ElevenLabsTTSThread,
     GeminiTTSThread,
     ChatterboxTTSThread,
@@ -138,6 +146,7 @@ class MainWindow(QMainWindow):
         self.translation_threads = []
         self.tts_threads = []
         self.eleven_api_key = ""
+        self.openai_api_key = ""
         self.region_select_overlay = None
         self.auto_area_overlay = None
         self.auto_area_device_rect = None  # last predicted area in device coords
@@ -146,6 +155,23 @@ class MainWindow(QMainWindow):
         self.current_keys_pressed = set()
         self.console_lines = []
         self.translation_history = []
+        self.batch_result_cache = {}
+        self.live_last_sig = None
+        self.live_last_trigger_sig = None
+        self.live_last_change_ts = 0.0
+        self.live_debounce_sec = 2.0
+        self.live_last_capture_ts = 0.0
+        self.live_capture_interval_sec = 0.5
+        self.live_diff_threshold = 0.05
+        self.live_baseline_delay_ms = 150
+        self.live_reinfer_threshold = 0.15
+        self.live_last_change_diff = 0.0
+        self.live_reinfer_next = False
+        self.live_empty_ratio_threshold = 0.6
+        self.live_trigger_active = False
+        self.live_page_mode = True
+        self.live_page_diff_threshold = 0.04
+        self.live_page_sig_size = 32
 
         self.init_ui()
         mp = prepare_latest_model()
@@ -282,7 +308,7 @@ class MainWindow(QMainWindow):
         left.addWidget(self.language_combo)
 
         self.model_combo = QComboBox()
-        self.model_combo.addItems([
+        gemini_models = [
             "gemini-3-flash-preview",
             "gemini-2.5-flash-preview-09-2025",
             "gemini-2.5-flash",
@@ -291,7 +317,12 @@ class MainWindow(QMainWindow):
             "gemini-2.5-pro-preview-03-25",
             "gemini-2.0-flash",
             "gemini-2.0-flash-lite",
-        ])
+        ]
+        for name in gemini_models:
+            self.model_combo.addItem(name, ("gemini", name))
+        self.model_combo.addItem("OpenAI GPT-4 Turbo", ("openai", "gpt-4-turbo"))
+        self.model_combo.addItem("OpenAI GPT-4o", ("openai", "gpt-4o"))
+        self.model_combo.addItem("OpenAI GPT-4o Mini", ("openai", "gpt-4o-mini"))
         self.model_combo.setCurrentIndex(2)
         left.addWidget(self.model_combo)
 
@@ -337,7 +368,19 @@ class MainWindow(QMainWindow):
 
         self.batch_processing_check = QCheckBox("Batch request (single API call)")
         self.batch_processing_check.setChecked(True)
+        self.batch_processing_check.stateChanged.connect(self.on_batch_toggle)
         mg.addWidget(self.batch_processing_check)
+        batch_row = QHBoxLayout()
+        batch_row.addWidget(QLabel("Batch size (max):"))
+        self.batch_size_spin = QSpinBox()
+        self.batch_size_spin.setRange(1, 40)
+        self.batch_size_spin.setValue(12)
+        self.batch_size_spin.setEnabled(self.batch_processing_check.isChecked())
+        batch_row.addWidget(self.batch_size_spin)
+        mg.addLayout(batch_row)
+        self.fast_mode_check = QCheckBox("Fast mode (downscale + low detail)")
+        self.fast_mode_check.stateChanged.connect(self.on_fast_mode_toggle)
+        mg.addWidget(self.fast_mode_check)
 
         left.addWidget(modifiers_group)
 
@@ -353,6 +396,15 @@ class MainWindow(QMainWindow):
 
         self.gradient_overlay_check = QCheckBox("Show gradient overlay")
         right.addWidget(self.gradient_overlay_check)
+
+        self.live_check = QCheckBox("Live updates (2s delay)")
+        self.live_check.stateChanged.connect(self.on_live_toggle)
+        right.addWidget(self.live_check)
+
+        self.debug_btn = QPushButton("Debug: OFF")
+        self.debug_btn.setCheckable(True)
+        self.debug_btn.toggled.connect(self.on_debug_toggle)
+        right.addWidget(self.debug_btn)
 
         self.gemini_tts_check = QCheckBox("Queue TTS (Gemini)")
         self.gemini_tts_check.stateChanged.connect(self.on_gemini_tts_toggle)
@@ -615,6 +667,334 @@ class MainWindow(QMainWindow):
             return combined
 
         return sorted(self.last_detections, key=weight)
+
+    def _compute_batch_size(self, total_count: int, max_size: int) -> int:
+        if total_count <= 0:
+            return 0
+        max_size = max(1, int(max_size))
+        if total_count <= max_size:
+            return total_count
+        target_batches = 3
+        size = math.ceil(total_count / target_batches)
+        if size > max_size:
+            target_batches = 4
+            size = math.ceil(total_count / target_batches)
+        if size > max_size:
+            size = max_size
+        if size < 2 and total_count > 1:
+            size = 2
+        return min(total_count, size)
+
+    def _detection_bbox(self, det):
+        if det['type'] == 'bbox':
+            return det['coords']
+        xs = [p[0] for p in det['coords']]
+        ys = [p[1] for p in det['coords']]
+        return (min(xs), min(ys), max(xs), max(ys))
+
+    def _debug_preview(self, text, limit=160):
+        if text is None:
+            return ""
+        cleaned = text.replace("\r", "\\r").replace("\n", "\\n")
+        if len(cleaned) > limit:
+            cleaned = cleaned[:limit] + "..."
+        return cleaned
+
+    def _debug_log_detections(self, ordered):
+        if not ordered:
+            debug_log("det_list empty")
+            return
+        debug_log(f"det_list total={len(ordered)}")
+        for idx, det in enumerate(ordered, start=1):
+            det_type = det.get("type", "")
+            cls = det.get("class_name", "")
+            if det_type == "bbox":
+                x1, y1, x2, y2 = det.get("coords", (0, 0, 0, 0))
+                debug_log(
+                    f"det id={idx} type=bbox class={cls} "
+                    f"box=({x1:.0f},{y1:.0f},{x2:.0f},{y2:.0f})"
+                )
+                continue
+            pts = det.get("coords") or []
+            if pts:
+                xs = [p[0] for p in pts]
+                ys = [p[1] for p in pts]
+                x1, y1, x2, y2 = min(xs), min(ys), max(xs), max(ys)
+                sample = ";".join([f"{p[0]:.0f},{p[1]:.0f}" for p in pts[:3]])
+            else:
+                x1 = y1 = x2 = y2 = 0.0
+                sample = ""
+            debug_log(
+                f"det id={idx} type=poly class={cls} "
+                f"box=({x1:.0f},{y1:.0f},{x2:.0f},{y2:.0f}) pts={sample}"
+            )
+
+    def _debug_log_translation(self, det_id, translation, original=""):
+        preview = self._debug_preview(translation)
+        orig_preview = self._debug_preview(original)
+        debug_log(
+            f"result id={det_id} len={len(translation)} text={preview} "
+            f"orig_len={len(original)} orig={orig_preview}"
+        )
+
+    def _compute_page_signature(self, screenshot_rgb):
+        if screenshot_rgb is None:
+            return None
+        size = max(8, int(self.live_page_sig_size))
+        pil_img = Image.fromarray(screenshot_rgb, "RGB")
+        small = pil_img.resize((size, size), Image.BILINEAR).convert("L")
+        arr = np.asarray(small, dtype=np.uint8)
+        return (arr // 16).astype(np.uint8)
+
+    def _compute_live_signature(self, screenshot_rgb):
+        if self.live_page_mode:
+            return self._compute_page_signature(screenshot_rgb)
+        return self._compute_text_signature(screenshot_rgb)
+
+    def _maybe_flag_live_reinfer(self, lines):
+        if not self.live_check.isChecked():
+            return
+        if not self.live_trigger_active:
+            return
+        if not lines:
+            self.live_trigger_active = False
+            return
+        total = len(lines)
+        empty = sum(1 for line in lines if not line.strip())
+        ratio = empty / float(total) if total else 0.0
+        debug_log(
+            f"live_result_empty_ratio={ratio:.2f} empty={empty} total={total}"
+        )
+        if ratio >= self.live_empty_ratio_threshold:
+            self.live_reinfer_next = True
+            debug_log("live_reinfer_due_to_empty")
+        self.live_trigger_active = False
+
+    def _hide_overlays_for_capture(self):
+        states = []
+        overlays = [
+            ("translation", self.translation_overlay),
+            ("detection", self.detection_overlay),
+            ("gradient", self.gradient_overlay),
+        ]
+        for name, overlay in overlays:
+            if overlay is None:
+                continue
+            try:
+                was_visible = overlay.isVisible()
+                if was_visible:
+                    overlay.setVisible(False)
+                states.append((overlay, was_visible, name))
+            except Exception:
+                continue
+        if states:
+            QGuiApplication.processEvents()
+            summary = ",".join([f"{name}:{int(vis)}" for _o, vis, name in states])
+            debug_log(f"capture_hide_overlays {summary}")
+        return states
+
+    def _restore_overlays(self, states):
+        if not states:
+            return
+        for overlay, was_visible, _name in states:
+            if not was_visible:
+                continue
+            try:
+                overlay.setVisible(True)
+            except Exception:
+                pass
+        QGuiApplication.processEvents()
+        summary = ",".join([f"{name}:{int(vis)}" for _o, vis, name in states])
+        debug_log(f"capture_restore_overlays {summary}")
+
+    def _compute_text_signature(self, screenshot_rgb):
+        if screenshot_rgb is None or not self.last_detections:
+            return None
+        h, w = screenshot_rgb.shape[:2]
+        boxes = []
+        for det in self.last_detections:
+            x1, y1, x2, y2 = self._detection_bbox(det)
+            x1 = int(max(0, min(w, x1)))
+            x2 = int(max(0, min(w, x2)))
+            y1 = int(max(0, min(h, y1)))
+            y2 = int(max(0, min(h, y2)))
+            if x2 - x1 < 2 or y2 - y1 < 2:
+                continue
+            boxes.append((x1, y1, x2, y2))
+        if not boxes:
+            return None
+        boxes.sort(key=lambda b: (b[1], b[0], b[3], b[2]))
+        pil_img = Image.fromarray(screenshot_rgb, "RGB")
+        sig_parts = []
+        for box in boxes:
+            crop = pil_img.crop(box).resize((16, 16), Image.BILINEAR).convert("L")
+            arr = np.asarray(crop, dtype=np.uint8)
+            q = (arr // 16).astype(np.uint8)
+            sig_parts.append(q)
+        if not sig_parts:
+            return None
+        return np.stack(sig_parts, axis=0)
+
+    def _signature_diff(self, sig_a, sig_b):
+        if sig_a is None or sig_b is None:
+            return None
+        if sig_a.shape != sig_b.shape:
+            return None
+        diff = np.abs(sig_a.astype(np.int16) - sig_b.astype(np.int16)).mean()
+        return float(diff) / 15.0
+
+    def _capture_signature_frame(self, hide_overlays=False):
+        if not self.region_device:
+            return None
+        states = []
+        if hide_overlays:
+            states = self._hide_overlays_for_capture()
+        try:
+            with mss.mss() as sct:
+                sshot = sct.grab(self.region_device)
+            return screenshot_to_array(sshot)
+        except Exception as e:
+            debug_log(f"live_capture_error={e}")
+            return None
+        finally:
+            if hide_overlays:
+                self._restore_overlays(states)
+
+    def _capture_text_signature(self):
+        if not self.region_device:
+            return None
+        if not self.live_page_mode and not self.last_detections:
+            return None
+        hide_overlays = not self.live_page_mode
+        img = self._capture_signature_frame(hide_overlays=hide_overlays)
+        if img is None:
+            return None
+        return self._compute_live_signature(img)
+
+    def _capture_current_screenshot(self, hide_overlays=False):
+        if not self.region_device:
+            return False
+        states = []
+        if hide_overlays:
+            states = self._hide_overlays_for_capture()
+        try:
+            with mss.mss() as sct:
+                sshot = capture_screenshot(sct, self.region_device)
+            self.screenshot_rgb = screenshot_to_array(sshot)
+            return True
+        except Exception as e:
+            debug_log(f"live_capture_error={e}")
+            return False
+        finally:
+            if hide_overlays:
+                self._restore_overlays(states)
+
+    def _live_translate(self):
+        overlay_visible = bool(self.translation_overlay and self.translation_overlay.isVisible())
+        debug_log(f"live_translate start overlay_visible={int(overlay_visible)}")
+        self.live_trigger_active = True
+        if not self._capture_current_screenshot(hide_overlays=True):
+            self.live_trigger_active = False
+            return
+        if self.bypass_yolo_check.isChecked() and not self.last_detections:
+            h, w = self.screenshot_rgb.shape[:2]
+            self.last_detections = [{
+                'type': 'bbox',
+                'coords': (0, 0, w, h),
+                'confidence': 1.0,
+                'class_id': -1,
+                'class_name': 'full_image',
+            }]
+        self.on_translate()
+
+    def _live_run_inference_and_translate(self):
+        if not self.region_device:
+            return
+        debug_log("live_infer start")
+        self.live_trigger_active = True
+        t_start = time.perf_counter()
+        if not self._capture_current_screenshot(hide_overlays=True):
+            self.live_trigger_active = False
+            return
+        t_capture = time.perf_counter()
+        debug_log(f"live_infer_capture_ms={int((t_capture - t_start) * 1000)}")
+        w = self.screenshot_rgb.shape[1]
+        h = self.screenshot_rgb.shape[0]
+
+        if self.bypass_yolo_check.isChecked():
+            self.last_detections = [{
+                'type': 'bbox',
+                'coords': (0, 0, w, h),
+                'confidence': 1.0,
+                'class_id': -1,
+                'class_name': 'full_image',
+            }]
+            debug_log("live_infer_bypass_yolo=true")
+            self.on_translate()
+            return
+
+        if not self.model:
+            debug_log("live_infer_no_model")
+            self.live_trigger_active = False
+            return
+
+        t_yolo_start = time.perf_counter()
+        results = self.model(self.screenshot_rgb, conf=0.25, iou=0.5)
+        t_yolo_end = time.perf_counter()
+        debug_log(f"live_infer_yolo_ms={int((t_yolo_end - t_yolo_start) * 1000)}")
+
+        t_parse_start = time.perf_counter()
+        self.last_detections = parse_yolo_results(results, w, h)
+        t_parse_end = time.perf_counter()
+        debug_log(
+            f"live_infer_parse_ms={int((t_parse_end - t_parse_start) * 1000)} "
+            f"detections={len(self.last_detections)}"
+        )
+        enabled_classes = self.get_enabled_classes()
+        if enabled_classes is not None:
+            before = len(self.last_detections)
+            self.last_detections = [
+                d for d in self.last_detections if d['class_name'] in enabled_classes
+            ]
+            debug_log(
+                f"live_infer_class_filter kept={len(self.last_detections)} "
+                f"dropped={before - len(self.last_detections)}"
+            )
+        if self.merge_overlap_check.isChecked():
+            is_alt = self.alt_overlap.isChecked()
+            thr = self.merge_iou_slider.value() / 100.0
+            t_merge_start = time.perf_counter()
+            self.last_detections = self.postProcessMergeByArea(
+                self.last_detections, overlap_threshold=thr, use_alt_merge=is_alt
+            )
+            t_merge_end = time.perf_counter()
+            debug_log(f"live_infer_merge_ms={int((t_merge_end - t_merge_start) * 1000)}")
+        debug_log(f"live_infer_total_ms={int((time.perf_counter() - t_start) * 1000)}")
+        self.on_translate()
+
+    def _update_live_signature_baseline(self):
+        if not self.live_check.isChecked():
+            return
+        sig = self._capture_text_signature()
+        if sig is None:
+            return
+        now = time.perf_counter()
+        self.live_last_sig = sig
+        self.live_last_trigger_sig = sig
+        self.live_last_change_ts = now
+        self.live_last_change_diff = 0.0
+        self.live_last_capture_ts = now
+        mode = "page" if self.live_page_mode else "text"
+        debug_log(f"live_baseline_updated shape={sig.shape} mode={mode}")
+
+    def _schedule_live_signature_baseline(self):
+        if not self.live_check.isChecked():
+            return
+        delay = int(self.live_baseline_delay_ms)
+        if delay <= 0:
+            self._update_live_signature_baseline()
+        else:
+            QTimer.singleShot(delay, self._update_live_signature_baseline)
 
     # ------------------------------------------------------------------
     def keyPressEvent(self, event):
@@ -938,36 +1318,54 @@ class MainWindow(QMainWindow):
         if not self.region_device:
             QMessageBox.warning(self, 'No region', 'Select a monitor/sub-area or enable Automatic Area.')
             return
+        t_start = time.perf_counter()
+        debug_log(f"inference_start region={self.region_device} bypass={self.bypass_yolo_check.isChecked()}")
         self.close_overlays()
         with mss.mss() as sct:
             sshot = capture_screenshot(sct, self.region_device)
         self.screenshot_rgb = screenshot_to_array(sshot)
+        t_capture = time.perf_counter()
+        debug_log(f"inference_capture_ms={int((t_capture - t_start) * 1000)}")
         w = self.screenshot_rgb.shape[1]
         h = self.screenshot_rgb.shape[0]
 
         if self.bypass_yolo_check.isChecked():
             self.last_detections = [{'type': 'bbox', 'coords': (0, 0, w, h), 'confidence': 1.0, 'class_id': -1, 'class_name': 'full_image'}]
             print('[on_run_inference] Bypassing YOLO, using full image.')
+            debug_log('inference_bypass_yolo=true')
             return
 
         if not self.model:
             QMessageBox.warning(self, 'No model', 'Load a YOLO model first.')
             return
         print('[on_run_inference] YOLO inference...')
+        t_yolo_start = time.perf_counter()
         results = self.model(self.screenshot_rgb, conf=0.25, iou=0.5)
+        t_yolo_end = time.perf_counter()
+        debug_log(f"inference_yolo_ms={int((t_yolo_end - t_yolo_start) * 1000)}")
         print('[on_run_inference] done.')
+        t_parse_start = time.perf_counter()
         self.last_detections = parse_yolo_results(results, w, h)
+        t_parse_end = time.perf_counter()
+        debug_log(
+            f"inference_parse_ms={int((t_parse_end - t_parse_start) * 1000)} "
+            f"detections={len(self.last_detections)}"
+        )
         print('[on_run_inference] # detections =>', len(self.last_detections))
         enabled_classes = self.get_enabled_classes()
         if enabled_classes is not None:
             before = len(self.last_detections)
             self.last_detections = [d for d in self.last_detections if d['class_name'] in enabled_classes]
             print(f'[on_run_inference] after class-filter ⇒ {len(self.last_detections)} (dropped {before - len(self.last_detections)})')
+            debug_log(f"inference_class_filter kept={len(self.last_detections)} dropped={before - len(self.last_detections)}")
         if self.merge_overlap_check.isChecked():
             print('Running iou merger')
             is_alt = self.alt_overlap.isChecked()
             thr = self.merge_iou_slider.value() / 100.0
+            t_merge_start = time.perf_counter()
             self.last_detections = self.postProcessMergeByArea(self.last_detections, overlap_threshold=thr, use_alt_merge=is_alt)
+            t_merge_end = time.perf_counter()
+            debug_log(f"inference_merge_ms={int((t_merge_end - t_merge_start) * 1000)}")
 
         if self.gradient_overlay_check.isChecked():
             self.gradient_overlay = GradientOverlay(self.region_logical, w, h, self.order_combo.currentData())
@@ -976,6 +1374,7 @@ class MainWindow(QMainWindow):
         self.detection_overlay = DetectionOverlay(self.region_logical, w, h)
         self.detection_overlay.detections = self.last_detections
         self.detection_overlay.update()
+        debug_log(f"inference_total_ms={int((time.perf_counter() - t_start) * 1000)}")
 
     def _run_area_inference_once(self):
         mon, _ = self._current_monitor()
@@ -1042,13 +1441,42 @@ class MainWindow(QMainWindow):
             print('No detections'); return
         if self.screenshot_rgb is None:
             QMessageBox.information(self, 'No screenshot', 'No screenshot to translate from!'); return
-        if not GEMINI_AVAILABLE:
-            QMessageBox.warning(self, 'Gemini missing', 'google.genai not installed!'); return
         if self.translation_threads:
             print('[on_translate] Translation in progress – ignoring duplicate call.'); return
+
+        model_entry = self.model_combo.currentData()
+        if isinstance(model_entry, tuple) and len(model_entry) == 2:
+            provider, model_name = model_entry
+        else:
+            model_name = (self.model_combo.currentText() or '').strip()
+            provider = 'gemini' if model_name.startswith('gemini-') else 'openai'
+
+        if provider == 'gemini':
+            if not GEMINI_AVAILABLE:
+                QMessageBox.warning(self, 'Gemini missing', 'google.genai not installed!'); return
+            if not (read_api_key_from_file() or self._check_api_key()):
+                return
+        elif provider == 'openai':
+            if not OPENAI_AVAILABLE:
+                QMessageBox.warning(self, 'OpenAI missing', 'openai not installed!'); return
+            if not self._check_openai_key():
+                return
+        else:
+            QMessageBox.warning(self, 'Model error', 'Unknown model provider.'); return
+
         self._stop_translation_threads()
-        self._log_console('━' * 40)
+        self._log_console('-' * 40)
         ordered = self._ordered_detections()
+        fast_mode = self.fast_mode_check.isChecked()
+        effective_batch = self.batch_processing_check.isChecked()
+        batch_size_limit = self.batch_size_spin.value()
+        batch_size_used = self._compute_batch_size(len(ordered), batch_size_limit) if effective_batch else 0
+        self._debug_log_detections(ordered)
+        debug_log(
+            f"translate_start provider={provider} model={model_name} "
+            f"detections={len(ordered)} batch={effective_batch} batch_size={batch_size_used} "
+            f"fast_mode={fast_mode} bypass={self.bypass_yolo_check.isChecked()}"
+        )
         show_overlay = not (self.bypass_yolo_check.isChecked() and not self.bypass_overlay_check.isChecked())
         if show_overlay:
             if not self.translation_overlay:
@@ -1075,64 +1503,122 @@ class MainWindow(QMainWindow):
         if self.detection_overlay:
             self.detection_overlay.hide()
         tgt_lang = self.language_combo.currentText()
-        gem_model = self.model_combo.currentText()
+        provider_label = 'Gemini' if provider == 'gemini' else 'OpenAI'
 
         ctx_enabled = self.context_check.isChecked()
         ctx_num = self.context_spin.value()
         ctx_relevant = self.context_relevant_check.isChecked()
-        prev_ctx = "\n".join(self.translation_history[-ctx_num:]) if ctx_enabled and ctx_num > 0 else ""
+        prev_ctx = "\n".join(self.translation_history[-ctx_num:]) if ctx_enabled and ctx_num > 0 else ''
+        debug_log(
+            f"translate_context enabled={ctx_enabled} size={ctx_num} relevant={ctx_relevant}"
+        )
         if ctx_enabled and ctx_num > 0:
             print('[on_translate] Sending context:\n' + prev_ctx)
 
         self.translation_threads = []
-        if self.batch_processing_check.isChecked():
-            thr = GeminiBatchTranslationThread(
-                ordered,
-                self.screenshot_rgb,
-                tgt_lang,
-                gem_model,
-                previous_context=prev_ctx,
-                use_context=ctx_enabled,
-                context_relevant=ctx_relevant,
+        if effective_batch:
+            self.batch_result_cache = {}
+            batch_size = max(1, batch_size_used)
+            total_batches = (len(ordered) + batch_size - 1) // batch_size if ordered else 0
+            for start in range(0, len(ordered), batch_size):
+                chunk = ordered[start:start + batch_size]
+                if provider == 'gemini':
+                    thr = GeminiBatchTranslationThread(
+                        chunk,
+                        self.screenshot_rgb,
+                        tgt_lang,
+                        model_name,
+                        previous_context=prev_ctx,
+                        use_context=ctx_enabled,
+                        context_relevant=ctx_relevant,
+                        fast_mode=fast_mode,
+                        start_index=start,
+                    )
+                else:
+                    thr = OpenAIBatchTranslationThread(
+                        chunk,
+                        self.screenshot_rgb,
+                        tgt_lang,
+                        model_name,
+                        previous_context=prev_ctx,
+                        use_context=ctx_enabled,
+                        context_relevant=ctx_relevant,
+                        fast_mode=fast_mode,
+                        start_index=start,
+                    )
+                thr.finished_signal.connect(self.on_batch_results)
+                thr.start()
+                self.translation_threads.append(thr)
+            print(f'[on_translate] Batch {provider_label} request launched ({total_batches} batches).')
+            debug_log(
+                f"translate_batch_started provider={provider_label} count={len(ordered)} "
+                f"batches={total_batches} batch_size={batch_size} max_batch={batch_size_limit}"
             )
-            thr.finished_signal.connect(self.on_batch_results)
-            thr.start()
-            self.translation_threads.append(thr)
-            print('[on_translate] Batch Gemini request launched.')
         else:
             for idx, det in enumerate(ordered):
-                thr = GeminiTranslationThread(
-                    idx,
-                    det,
-                    self.screenshot_rgb,
-                    tgt_lang,
-                    gem_model,
-                    previous_context=prev_ctx,
-                    use_context=ctx_enabled,
-                    context_relevant=ctx_relevant,
-                )
+                if provider == 'gemini':
+                    thr = GeminiTranslationThread(
+                        idx,
+                        det,
+                        self.screenshot_rgb,
+                        tgt_lang,
+                        model_name,
+                        previous_context=prev_ctx,
+                        use_context=ctx_enabled,
+                        context_relevant=ctx_relevant,
+                        fast_mode=fast_mode,
+                    )
+                else:
+                    thr = OpenAITranslationThread(
+                        idx,
+                        det,
+                        self.screenshot_rgb,
+                        tgt_lang,
+                        model_name,
+                        previous_context=prev_ctx,
+                        use_context=ctx_enabled,
+                        context_relevant=ctx_relevant,
+                        fast_mode=fast_mode,
+                    )
                 thr.finished_signal.connect(self.on_final_result)
                 thr.start()
                 self.translation_threads.append(thr)
-            print(f'[on_translate] Spawned {len(self.translation_threads)} per-crop threads.')
+            print(f'[on_translate] Spawned {len(self.translation_threads)} per-crop threads ({provider_label}).')
+            debug_log(f"translate_per_crop_started provider={provider_label} count={len(self.translation_threads)}")
 
     @pyqtSlot(dict, str)
     def on_batch_results(self, mapping, error_msg):
         if error_msg:
+            if self.live_trigger_active:
+                self.live_trigger_active = False
             self._log_console(error_msg)
             return
+        if mapping is None:
+            mapping = {}
+        debug_log(f"batch_results received={len(mapping)}")
+        if not hasattr(self, 'batch_result_cache') or self.batch_result_cache is None:
+            self.batch_result_cache = {}
+
         if self.translation_overlay:
-            for idx, itm in enumerate(self.translation_overlay.translated_items, start=1):
-                entry = mapping.get(str(idx), {})
+            for idx_str, entry in mapping.items():
+                try:
+                    idx = int(idx_str)
+                except Exception:
+                    continue
+                if idx < 1 or idx > len(self.translation_overlay.translated_items):
+                    continue
+                itm = self.translation_overlay.translated_items[idx - 1]
                 if isinstance(entry, dict):
                     trans = (entry.get('translation') or '').strip()
                     orig = (entry.get('original') or '').strip()
                 else:
                     trans = (entry or '').strip()
                     orig = ''
+                self._debug_log_translation(idx, trans, orig)
                 itm['text'] = trans
                 self._log_console(f"{idx}. {trans}")
                 self._add_history(trans, orig)
+                self.batch_result_cache[idx] = trans
             self.translation_overlay.update()
         else:
             for idx_str, val in sorted(mapping.items(), key=lambda p: int(p[0])):
@@ -1142,21 +1628,23 @@ class MainWindow(QMainWindow):
                 else:
                     trans = (val or '').strip()
                     orig = ''
+                self._debug_log_translation(int(idx_str), trans, orig)
                 self._log_console(f"{idx_str}. {trans}")
                 self._add_history(trans, orig)
+                try:
+                    self.batch_result_cache[int(idx_str)] = trans
+                except Exception:
+                    pass
 
-        ordered_lines = []
-        if self.translation_overlay:
-            ordered_lines = [itm['text'] for itm in self.translation_overlay.translated_items]
-        else:
-            for i in range(1, len(mapping) + 1):
-                val = mapping.get(str(i), {})
-                if isinstance(val, dict):
-                    ordered_lines.append((val.get('translation') or '').strip())
-                else:
-                    ordered_lines.append((val or '').strip())
-
-        self._start_tts(ordered_lines)
+        self.translation_threads = [t for t in self.translation_threads if t.isRunning()]
+        if not self.translation_threads:
+            if self.translation_overlay:
+                ordered_lines = [itm['text'] for itm in self.translation_overlay.translated_items]
+            else:
+                ordered_lines = [self.batch_result_cache[k] for k in sorted(self.batch_result_cache)]
+            self._start_tts(ordered_lines)
+            self._maybe_flag_live_reinfer(ordered_lines)
+            self._schedule_live_signature_baseline()
 
     @pyqtSlot()
     def on_run_all(self):
@@ -1168,6 +1656,7 @@ class MainWindow(QMainWindow):
     def on_final_result(self, det_id, text):
         print(f'[on_final_result] det_id={det_id}, text={repr(text)}')
         clean = text.strip()
+        self._debug_log_translation(det_id + 1, clean, "")
         self._log_console(f"{det_id + 1}. {clean}")
         self._add_history(clean)
         if self.translation_overlay:
@@ -1177,6 +1666,8 @@ class MainWindow(QMainWindow):
         if not self.translation_threads and self.translation_overlay:
             lines = [itm['text'] for itm in self.translation_overlay.translated_items]
             self._start_tts(lines)
+            self._maybe_flag_live_reinfer(lines)
+            self._schedule_live_signature_baseline()
 
     @pyqtSlot()
     def on_clear_history(self):
@@ -1204,9 +1695,108 @@ class MainWindow(QMainWindow):
         # Intentionally do NOT close auto_area_overlay here. It is independent.
 
     def periodic_check(self):
-        pass
+        if not self.live_check.isChecked():
+            return
+        if not self.region_device:
+            return
+        if not self.live_page_mode and not self.last_detections:
+            return
+        if self.translation_threads:
+            return
+        now = time.perf_counter()
+        if now - self.live_last_capture_ts < self.live_capture_interval_sec:
+            return
+        self.live_last_capture_ts = now
+        sig = self._capture_text_signature()
+        if sig is None:
+            return
+        diff_threshold = (
+            self.live_page_diff_threshold if self.live_page_mode else self.live_diff_threshold
+        )
+        mode = "page" if self.live_page_mode else "text"
+        diff = self._signature_diff(sig, self.live_last_sig)
+        if diff is None:
+            prev_shape = getattr(self.live_last_sig, "shape", None)
+            debug_log(
+                f"live_sig_reset shape_cur={sig.shape} shape_prev={prev_shape} mode={mode}"
+            )
+            self.live_last_sig = sig
+            self.live_last_trigger_sig = sig
+            self.live_last_change_ts = now
+            self.live_last_change_diff = 1.0
+            self.live_reinfer_next = True
+            return
+        if diff > diff_threshold:
+            self.live_last_sig = sig
+            self.live_last_change_ts = now
+            self.live_last_change_diff = diff
+            self.live_reinfer_next = self.live_page_mode or diff >= self.live_reinfer_threshold
+            debug_log(f"live_change_detected diff={diff:.3f} mode={mode}")
+            return
+        self.live_last_sig = sig
+        if now - self.live_last_change_ts < self.live_debounce_sec:
+            return
+        if self.translation_threads:
+            return
+        trigger_diff = self._signature_diff(sig, self.live_last_trigger_sig)
+        if trigger_diff is None:
+            prev_shape = getattr(self.live_last_trigger_sig, "shape", None)
+            debug_log(
+                f"live_trigger_reset shape_cur={sig.shape} shape_prev={prev_shape} mode={mode}"
+            )
+            self.live_last_trigger_sig = sig
+            return
+        if trigger_diff <= diff_threshold:
+            return
+        self.live_last_trigger_sig = sig
+        reinfer = self.live_reinfer_next
+        debug_log(
+            f"live_trigger diff={self.live_last_change_diff:.3f} reinfer={int(reinfer)} mode={mode}"
+        )
+        self.live_reinfer_next = False
+        if reinfer:
+            self._live_run_inference_and_translate()
+        else:
+            self._live_translate()
 
     # removed: timer-based auto area tick (replaced by worker thread)
+
+    @pyqtSlot(bool)
+    def on_debug_toggle(self, enabled):
+        if enabled:
+            set_debug_logging(True)
+            self.debug_btn.setText("Debug: ON")
+            debug_log("debug_enabled")
+        else:
+            debug_log("debug_disabled")
+            set_debug_logging(False)
+            self.debug_btn.setText("Debug: OFF")
+
+    @pyqtSlot(int)
+    def on_live_toggle(self, _):
+        enabled = self.live_check.isChecked()
+        self.live_last_sig = None
+        self.live_last_trigger_sig = None
+        self.live_last_change_ts = time.perf_counter()
+        self.live_last_capture_ts = 0.0
+        self.live_last_change_diff = 0.0
+        self.live_reinfer_next = False
+        self.live_trigger_active = False
+        mode = "page" if self.live_page_mode else "text"
+        debug_log(f"live_enabled={enabled} mode={mode}")
+        if enabled and not self.translation_threads:
+            self._schedule_live_signature_baseline()
+
+    @pyqtSlot(int)
+    def on_fast_mode_toggle(self, _):
+        enabled = self.fast_mode_check.isChecked()
+        debug_log(f"fast_mode enabled={enabled}")
+
+    @pyqtSlot(int)
+    def on_batch_toggle(self, _):
+        enabled = self.batch_processing_check.isChecked()
+        self.batch_size_spin.setEnabled(enabled)
+        debug_log(f"batch_mode enabled={enabled} max_size={self.batch_size_spin.value()}")
 
     @pyqtSlot(int)
     def on_chatterbox_tts_toggle(self, _):
@@ -1250,6 +1840,27 @@ class MainWindow(QMainWindow):
             try:
                 with open(path, 'w', encoding='utf-8') as f:
                     f.write(text.strip())
+                return True
+            except Exception as e:
+                QMessageBox.warning(self, 'Error', f'Failed to save API key: {e}')
+        return False
+
+    def _check_openai_key(self):
+        key = self.openai_api_key or read_openai_key_from_file()
+        if key:
+            self.openai_api_key = key
+            return True
+        text, ok = QInputDialog.getText(
+            self,
+            'Enter API Key',
+            'OpenAI API key:'
+        )
+        if ok and text.strip():
+            path = os.path.join(os.path.dirname(__file__), 'openai_api_key.txt')
+            try:
+                with open(path, 'w', encoding='utf-8') as f:
+                    f.write(text.strip())
+                self.openai_api_key = text.strip()
                 return True
             except Exception as e:
                 QMessageBox.warning(self, 'Error', f'Failed to save API key: {e}')

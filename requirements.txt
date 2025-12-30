@@ -8,6 +8,7 @@ pywin32
 huggingface_hub
 google-api-core
 google-genai
+openai
 pillow
 elevenlabs
 sounddevice

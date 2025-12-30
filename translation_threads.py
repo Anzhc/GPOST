@@ -5,6 +5,7 @@ import time
 import threading
 import re
 import sys
+import base64
 from typing import Dict
 from pathlib import Path
 import numpy as np
@@ -16,7 +17,16 @@ import wave
 from PyQt6.QtCore import QThread, pyqtSignal
 from PIL import Image
 
-from google.api_core import exceptions as gexc
+try:
+    from google.api_core import exceptions as gexc
+except Exception:
+    class _DummyServiceUnavailable(Exception):
+        pass
+
+    class _DummyGexc:
+        ServiceUnavailable = _DummyServiceUnavailable
+
+    gexc = _DummyGexc()
 
 try:
     from google import genai
@@ -29,7 +39,23 @@ except Exception:
     genai = None
     print("[WARNING] google.genai not installed.")
 
-from utils import read_api_key_from_file, crop_polygon_or_bbox
+try:
+    from openai import OpenAI, APIError, RateLimitError, APITimeoutError, APIConnectionError
+    OPENAI_AVAILABLE = True
+    print("[INFO] openai imported successfully.")
+except Exception:
+    OPENAI_AVAILABLE = False
+    OpenAI = None
+    APIError = RateLimitError = APITimeoutError = APIConnectionError = Exception
+    print("[WARNING] openai not installed.")
+
+from utils import (
+    read_api_key_from_file,
+    read_openai_key_from_file,
+    crop_polygon_or_bbox,
+    debug_log,
+    prepare_image_for_api,
+)
 try:
     import miniaudio              # decoder only
 except ImportError:
@@ -64,6 +90,10 @@ SYSTEM_INSTRUCTION = (
     """
     )
 
+FAST_IMAGE_MAX_DIM = 384
+FAST_JPEG_QUALITY = 70
+OPENAI_IMAGE_DETAIL = "low"
+
 
 if GEMINI_AVAILABLE:
     SAFETY_SETTINGS = [
@@ -81,11 +111,38 @@ def _is_503_error(exc_or_text) -> bool:
     return "503" in str(exc_or_text) and "UNAVAILABLE" in str(exc_or_text)
 
 
+def _is_retryable_openai_error(exc: Exception) -> bool:
+    if not OPENAI_AVAILABLE:
+        return False
+    if isinstance(exc, (RateLimitError, APITimeoutError, APIConnectionError)):
+        return True
+    status = getattr(exc, "status_code", None)
+    return status in (429, 500, 502, 503, 504)
+
+
+def _image_path_to_data_url(path: str) -> str:
+    with open(path, "rb") as f:
+        b64 = base64.b64encode(f.read()).decode("ascii")
+    suffix = Path(path).suffix.lower()
+    if suffix in (".jpg", ".jpeg"):
+        mime = "image/jpeg"
+    else:
+        mime = "image/png"
+    return f"data:{mime};base64,{b64}"
+
+
+def _strip_json_fence(text: str) -> str:
+    clean = text.strip()
+    if clean.startswith("```"):
+        clean = clean.lstrip("```json").lstrip("```").rstrip("```").strip()
+    return clean
+
+
 class GeminiTranslationThread(QThread):
     finished_signal = pyqtSignal(int, str)
 
     def __init__(self, det_id, detection, screenshot_rgb, target_language, model_name,
-                 previous_context="", use_context=False, context_relevant=False, parent=None):
+                 previous_context="", use_context=False, context_relevant=False, fast_mode=False, parent=None):
         super().__init__(parent)
         self.det_id = det_id
         self.detection = detection
@@ -95,6 +152,7 @@ class GeminiTranslationThread(QThread):
         self.previous_context = previous_context
         self.use_context = use_context
         self.context_relevant = context_relevant
+        self.fast_mode = bool(fast_mode)
         self._stopped = False
 
     def stop(self):
@@ -105,17 +163,45 @@ class GeminiTranslationThread(QThread):
             self.finished_signal.emit(self.det_id, "[Error] google.genai not installed.")
             return
 
+        t_start = time.perf_counter()
+        debug_log(
+            f"gemini_single start id={self.det_id} model={self.model_name} "
+            f"target={self.target_language} fast_mode={self.fast_mode}"
+        )
+
         api_key = read_api_key_from_file()
         if not api_key:
             self.finished_signal.emit(self.det_id, "[Error] no API key in api_key.txt")
+            debug_log("gemini_single missing_api_key")
             return
 
+        t_crop_start = time.perf_counter()
         cropped_path = crop_polygon_or_bbox(self.screenshot_rgb, self.detection)
         if not cropped_path:
             self.finished_signal.emit(self.det_id, "[Error] cannot crop region")
+            debug_log("gemini_single crop_failed")
             return
+        debug_log(f"gemini_single crop_ms={int((time.perf_counter() - t_crop_start) * 1000)}")
 
         yolo_class = self.detection.get("class_name", "")
+        debug_log(f"gemini_single class={yolo_class}")
+        processed_path = cropped_path
+        if self.fast_mode:
+            processed_path, info = prepare_image_for_api(
+                cropped_path,
+                max_dim=FAST_IMAGE_MAX_DIM,
+                jpeg_quality=FAST_JPEG_QUALITY,
+            )
+            if processed_path != cropped_path:
+                try:
+                    os.remove(cropped_path)
+                except Exception:
+                    pass
+            debug_log(
+                f"gemini_single fast_mode=1 orig={info.get('orig_size')} "
+                f"new={info.get('new_size')} scale={info.get('scale')} fmt={info.get('format')} "
+                f"max_dim={FAST_IMAGE_MAX_DIM} jpeg_quality={FAST_JPEG_QUALITY}"
+            )
         user_prompt = f"""
 You are a translation engine.
 
@@ -157,7 +243,7 @@ Here is the context of previous translations, arranged in a [translation - origi
 """
 
         client = genai.Client(api_key=api_key)
-        pil_img = Image.open(cropped_path)
+        pil_img = Image.open(processed_path)
         backoff = 1.0
         max_tries = 10
         final_text = "[Error] Unknown failure."
@@ -165,6 +251,7 @@ Here is the context of previous translations, arranged in a [translation - origi
         for attempt in range(max_tries):
             if self._stopped:
                 return
+            t_req_start = time.perf_counter()
             try:
                 response = client.models.generate_content(
                     model=self.model_name,
@@ -184,25 +271,33 @@ Here is the context of previous translations, arranged in a [translation - origi
                     except json.JSONDecodeError:
                         pass
                 final_text = response.text or ""
+                debug_log(
+                    f"gemini_single request_ms={int((time.perf_counter() - t_req_start) * 1000)} "
+                    f"attempts={attempt + 1} text_len={len(final_text.strip())}"
+                )
                 break
-            except gexc.ServiceUnavailable:
-                pass
+            except gexc.ServiceUnavailable as e:
+                debug_log(f"gemini_single retry attempt={attempt + 1} error={e}")
             except Exception as e:
                 if not _is_503_error(e):
                     final_text = f"[GeminiTranslationThread error => {e}]"
+                    debug_log(f"gemini_single error attempt={attempt + 1} error={e}")
                     break
+                debug_log(f"gemini_single retry attempt={attempt + 1} error={e}")
             if attempt == max_tries - 1:
                 final_text = "[Error] Gemini model overloaded after retries.]"
+                debug_log("gemini_single error attempt=max retries")
                 break
             sleep_for = backoff + random.uniform(0, 0.5)
             time.sleep(sleep_for)
             backoff *= 2
 
         try:
-            os.remove(cropped_path)
+            os.remove(processed_path)
         except Exception:
             pass
 
+        debug_log(f"gemini_single total_ms={int((time.perf_counter() - t_start) * 1000)} text_len={len(final_text.strip())}")
         self.finished_signal.emit(self.det_id, final_text)
 
 
@@ -210,7 +305,8 @@ class GeminiBatchTranslationThread(QThread):
     finished_signal = pyqtSignal(dict, str)
 
     def __init__(self, detections, screenshot_rgb, target_language, model_name,
-                 previous_context="", use_context=False, context_relevant=False, parent=None):
+                 previous_context="", use_context=False, context_relevant=False,
+                 fast_mode=False, start_index=0, parent=None):
         super().__init__(parent)
         self.detections = detections
         self.screenshot_rgb = screenshot_rgb
@@ -219,6 +315,8 @@ class GeminiBatchTranslationThread(QThread):
         self.previous_context = previous_context
         self.use_context = use_context
         self.context_relevant = context_relevant
+        self.fast_mode = bool(fast_mode)
+        self.start_index = int(start_index)
         self._stopped = False
 
     def stop(self):
@@ -228,25 +326,58 @@ class GeminiBatchTranslationThread(QThread):
         if not GEMINI_AVAILABLE or self._stopped:
             self.finished_signal.emit({}, "")
             return
+        t_start = time.perf_counter()
+        debug_log(
+            f"gemini_batch start model={self.model_name} target={self.target_language} "
+            f"count={len(self.detections)} fast_mode={self.fast_mode} start_index={self.start_index}"
+        )
         api_key = read_api_key_from_file()
         if not api_key:
             self.finished_signal.emit({}, "")
+            debug_log("gemini_batch missing_api_key")
             return
 
         crop_paths, crop_imgs, idx_map = [], [], []
+        fast_scales = []
+        t_crop_start = time.perf_counter()
         for i, det in enumerate(self.detections, start=1):
             if self._stopped:
                 self.finished_signal.emit({}, "")
                 return
             pth = crop_polygon_or_bbox(self.screenshot_rgb, det)
             if pth:
-                crop_paths.append(pth)
-                crop_imgs.append(Image.open(pth))
-                idx_map.append(str(i))
+                use_path = pth
+                if self.fast_mode:
+                    use_path, info = prepare_image_for_api(
+                        pth,
+                        max_dim=FAST_IMAGE_MAX_DIM,
+                        jpeg_quality=FAST_JPEG_QUALITY,
+                    )
+                    if use_path != pth:
+                        try:
+                            os.remove(pth)
+                        except Exception:
+                            pass
+                    if info.get("scale") is not None:
+                        fast_scales.append(info["scale"])
+                crop_paths.append(use_path)
+                crop_imgs.append(Image.open(use_path))
+                idx_map.append(str(self.start_index + i))
 
         if not crop_imgs or self._stopped:
             self.finished_signal.emit({}, "")
+            debug_log("gemini_batch no_crops")
             return
+        debug_log(
+            f"gemini_batch crop_ms={int((time.perf_counter() - t_crop_start) * 1000)} "
+            f"count={len(crop_imgs)}"
+        )
+        if self.fast_mode and fast_scales:
+            avg_scale = sum(fast_scales) / len(fast_scales)
+            debug_log(
+                f"gemini_batch fast_mode=1 avg_scale={avg_scale:.3f} "
+                f"max_dim={FAST_IMAGE_MAX_DIM} jpeg_quality={FAST_JPEG_QUALITY}"
+            )
 
         user_prompt = f"""
 You are a translation engine.
@@ -301,6 +432,7 @@ Here is the context of previous translations, arranged in a [translation - origi
             if self._stopped:
                 self.finished_signal.emit({}, "")
                 return
+            t_req_start = time.perf_counter()
             try:
                 resp = client.models.generate_content(
                     model=self.model_name,
@@ -316,6 +448,10 @@ Here is the context of previous translations, arranged in a [translation - origi
                 if clean.startswith("```"):
                     clean = clean.lstrip("```json").lstrip("```").rstrip("```").strip()
                 mapping = json.loads(clean)
+                debug_log(
+                    f"gemini_batch request_ms={int((time.perf_counter() - t_req_start) * 1000)} "
+                    f"attempts={attempt + 1} items={len(mapping)}"
+                )
                 break
             except Exception as e:
                 if attempt == max_tries - 1 or not _is_503_error(e):
@@ -333,9 +469,375 @@ Here is the context of previous translations, arranged in a [translation - origi
                     else:
                         error_msg = f"[Gemini error => {err_txt}]"
                     mapping = {}
+                    debug_log(f"gemini_batch error attempt={attempt + 1} error={err_txt}")
                     break
+                debug_log(f"gemini_batch retry attempt={attempt + 1} error={e}")
                 time.sleep(backoff + random.uniform(0, 0.5))
                 backoff *= 2
+
+        debug_log(f"gemini_batch total_ms={int((time.perf_counter() - t_start) * 1000)} items={len(mapping)}")
+
+        for p in crop_paths:
+            try:
+                os.remove(p)
+            except Exception:
+                pass
+
+        self.finished_signal.emit(mapping, error_msg)
+
+
+class OpenAITranslationThread(QThread):
+    finished_signal = pyqtSignal(int, str)
+
+    def __init__(self, det_id, detection, screenshot_rgb, target_language, model_name,
+                 previous_context="", use_context=False, context_relevant=False, fast_mode=False, parent=None):
+        super().__init__(parent)
+        self.det_id = det_id
+        self.detection = detection
+        self.screenshot_rgb = screenshot_rgb
+        self.target_language = target_language
+        self.model_name = model_name
+        self.previous_context = previous_context
+        self.use_context = use_context
+        self.context_relevant = context_relevant
+        self.fast_mode = bool(fast_mode)
+        self._stopped = False
+
+    def stop(self):
+        self._stopped = True
+
+    def run(self):
+        if not OPENAI_AVAILABLE:
+            self.finished_signal.emit(self.det_id, "[Error] openai not installed.")
+            debug_log("openai_single missing_openai_module")
+            return
+
+        t_start = time.perf_counter()
+        debug_log(
+            f"openai_single start id={self.det_id} model={self.model_name} "
+            f"target={self.target_language} fast_mode={self.fast_mode}"
+        )
+
+        api_key = read_openai_key_from_file()
+        if not api_key:
+            self.finished_signal.emit(self.det_id, "[Error] no OpenAI API key available.")
+            debug_log("openai_single missing_api_key")
+            return
+
+        t_crop_start = time.perf_counter()
+        cropped_path = crop_polygon_or_bbox(self.screenshot_rgb, self.detection)
+        if not cropped_path:
+            self.finished_signal.emit(self.det_id, "[Error] cannot crop region")
+            debug_log("openai_single crop_failed")
+            return
+        debug_log(f"openai_single crop_ms={int((time.perf_counter() - t_crop_start) * 1000)}")
+
+        yolo_class = self.detection.get("class_name", "")
+        debug_log(f"openai_single class={yolo_class}")
+        processed_path = cropped_path
+        if self.fast_mode:
+            processed_path, info = prepare_image_for_api(
+                cropped_path,
+                max_dim=FAST_IMAGE_MAX_DIM,
+                jpeg_quality=FAST_JPEG_QUALITY,
+            )
+            if processed_path != cropped_path:
+                try:
+                    os.remove(cropped_path)
+                except Exception:
+                    pass
+            debug_log(
+                f"openai_single fast_mode=1 orig={info.get('orig_size')} "
+                f"new={info.get('new_size')} scale={info.get('scale')} fmt={info.get('format')} "
+                f"max_dim={FAST_IMAGE_MAX_DIM} jpeg_quality={FAST_JPEG_QUALITY}"
+            )
+        user_prompt = f"""
+You are a translation engine.
+
+TASK
+Translate everything that can be read in the image into **{self.target_language}**.
+That translation will be used for filtering down the line.
+
+RULES
+1. Keep meaning 100 % intact, including NSFW words.
+2. NSFW must be as true to original intent as possible.
+3. Preserve punctuation; keep existing line-breaks unless a word must wrap mid-line.
+4. Output **only** the final translation - no quotes, no commentary.
+5. Do not leave original language text in output, always translate it in entirety.
+6. If the crop contains no readable text, return a single space.
+7. If the crop is a non-verbal sound-effect (onomatopoeia), write it phonetically in target language characters.
+8. Do not add introductions, explanations, or labels.
+9. If original text is vertical, write it down as if it was horizontal.
+
+CONTEXT
+We classify give image as: "{yolo_class}"
+"""
+
+        if self.use_context and self.previous_context:
+            if self.context_relevant:
+                user_prompt += f"""
+
+User considers previous translation relevant to current request.
+
+Here is the context of previous translations, arranged in a [translation - original] format:
+{self.previous_context}
+"""
+            else:
+                user_prompt += f"""
+
+User does not consider previous translation context relevant to current translation. Use it only as translation style and guide reference.
+
+Here is the context of previous translations, arranged in a [translation - original] format:
+{self.previous_context}
+"""
+
+        data_url = _image_path_to_data_url(processed_path)
+        try:
+            os.remove(processed_path)
+        except Exception:
+            pass
+
+        client = OpenAI(api_key=api_key)
+        image_payload = {"url": data_url}
+        if self.fast_mode:
+            image_payload["detail"] = OPENAI_IMAGE_DETAIL
+        messages = [
+            {"role": "system", "content": SYSTEM_INSTRUCTION},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": user_prompt},
+                    {"type": "image_url", "image_url": image_payload},
+                ],
+            },
+        ]
+
+        backoff = 1.0
+        max_tries = 10
+        final_text = "[Error] Unknown failure."
+
+        for attempt in range(max_tries):
+            if self._stopped:
+                return
+            t_req_start = time.perf_counter()
+            try:
+                response = client.chat.completions.create(
+                    model=self.model_name,
+                    messages=messages,
+                    temperature=0.25,
+                )
+                msg = response.choices[0].message if response.choices else None
+                final_text = (getattr(msg, "content", "") or "")
+                debug_log(
+                    f"openai_single request_ms={int((time.perf_counter() - t_req_start) * 1000)} "
+                    f"attempts={attempt + 1} text_len={len(final_text.strip())}"
+                )
+                break
+            except Exception as e:
+                if not _is_retryable_openai_error(e) or attempt == max_tries - 1:
+                    final_text = f"[OpenAITranslationThread error => {e}]"
+                    debug_log(f"openai_single error attempt={attempt + 1} error={e}")
+                    break
+                debug_log(f"openai_single retry attempt={attempt + 1} error={e}")
+            sleep_for = backoff + random.uniform(0, 0.5)
+            time.sleep(sleep_for)
+            backoff *= 2
+
+        debug_log(f"openai_single total_ms={int((time.perf_counter() - t_start) * 1000)} text_len={len(final_text.strip())}")
+        self.finished_signal.emit(self.det_id, final_text)
+
+
+class OpenAIBatchTranslationThread(QThread):
+    finished_signal = pyqtSignal(dict, str)
+
+    def __init__(self, detections, screenshot_rgb, target_language, model_name,
+                 previous_context="", use_context=False, context_relevant=False,
+                 fast_mode=False, start_index=0, parent=None):
+        super().__init__(parent)
+        self.detections = detections
+        self.screenshot_rgb = screenshot_rgb
+        self.target_language = target_language
+        self.model_name = model_name
+        self.previous_context = previous_context
+        self.use_context = use_context
+        self.context_relevant = context_relevant
+        self.fast_mode = bool(fast_mode)
+        self.start_index = int(start_index)
+        self._stopped = False
+
+    def stop(self):
+        self._stopped = True
+
+    def run(self):
+        if not OPENAI_AVAILABLE or self._stopped:
+            self.finished_signal.emit({}, "")
+            return
+        t_start = time.perf_counter()
+        debug_log(
+            f"openai_batch start model={self.model_name} target={self.target_language} "
+            f"count={len(self.detections)} fast_mode={self.fast_mode} start_index={self.start_index}"
+        )
+        api_key = read_openai_key_from_file()
+        if not api_key:
+            self.finished_signal.emit({}, "")
+            debug_log("openai_batch missing_api_key")
+            return
+
+        crop_paths, data_urls, idx_map = [], [], []
+        fast_scales = []
+        t_crop_start = time.perf_counter()
+        for i, det in enumerate(self.detections, start=1):
+            if self._stopped:
+                self.finished_signal.emit({}, "")
+                return
+            pth = crop_polygon_or_bbox(self.screenshot_rgb, det)
+            if pth:
+                use_path = pth
+                if self.fast_mode:
+                    use_path, info = prepare_image_for_api(
+                        pth,
+                        max_dim=FAST_IMAGE_MAX_DIM,
+                        jpeg_quality=FAST_JPEG_QUALITY,
+                    )
+                    if use_path != pth:
+                        try:
+                            os.remove(pth)
+                        except Exception:
+                            pass
+                    if info.get("scale") is not None:
+                        fast_scales.append(info["scale"])
+                crop_paths.append(use_path)
+                data_urls.append(_image_path_to_data_url(use_path))
+                idx_map.append(str(self.start_index + i))
+
+        if not data_urls or self._stopped:
+            self.finished_signal.emit({}, "")
+            debug_log("openai_batch no_crops")
+            return
+        debug_log(
+            f"openai_batch crop_ms={int((time.perf_counter() - t_crop_start) * 1000)} "
+            f"count={len(data_urls)}"
+        )
+        if self.fast_mode and fast_scales:
+            avg_scale = sum(fast_scales) / len(fast_scales)
+            debug_log(
+                f"openai_batch fast_mode=1 avg_scale={avg_scale:.3f} "
+                f"max_dim={FAST_IMAGE_MAX_DIM} jpeg_quality={FAST_JPEG_QUALITY}"
+            )
+
+        user_prompt = f"""
+You are a translation engine.
+
+TASK
+You will receive {len(data_urls)} images. They are in the same order as these crop numbers: {', '.join(idx_map)}.
+
+Crops are usually made from single document, translate them in context of each other, if applicable.
+
+Translate all readable text in each image into **{self.target_language}**. Return one JSON object with the crop numbers as keys. Each value should be another JSON object with keys "translation" and "original". Example:
+{{"1": {{"translation": "Hello", "original": "Hello"}}, "2": {{"translation": "Goodbye", "original": "Goodbye"}}}}
+
+RULES
+1. Keep meaning 100 % intact, including NSFW words.
+2. NSFW must be as true to original intent as possible.
+3. Preserve punctuation; keep existing line-breaks unless a word must wrap mid-line.
+4. Output **only** the final translation - no quotes, no commentary.
+5. Do not leave original language text in output, always translate it in entirety.
+6. If the crop contains no readable text, return a single space.
+7. If the crop is a non-verbal sound-effect (onomatopoeia), write it phonetically in target language characters.
+8. Do not add introductions, explanations, or labels.
+9. If original text is vertical, write it down as if it was horizontal.
+10. JSON format is extremely important. Make sure it's correct.
+
+""".strip()
+
+        if self.use_context and self.previous_context:
+            if self.context_relevant:
+                user_prompt += f"""
+
+User considers previous translation relevant to current request.
+
+Here is the context of previous translations, arranged in a [translation - original] format:
+{self.previous_context}
+"""
+            else:
+                user_prompt += f"""
+
+User does not consider previous translation context relevant to current translation. Use it only as translation style and guide reference.
+
+Here is the context of previous translations, arranged in a [translation - original] format:
+{self.previous_context}
+"""
+
+        client = OpenAI(api_key=api_key)
+        content = [{"type": "text", "text": user_prompt}]
+        for url in data_urls:
+            image_payload = {"url": url}
+            if self.fast_mode:
+                image_payload["detail"] = OPENAI_IMAGE_DETAIL
+            content.append({"type": "image_url", "image_url": image_payload})
+        messages = [
+            {"role": "system", "content": SYSTEM_INSTRUCTION},
+            {"role": "user", "content": content},
+        ]
+
+        backoff, max_tries = 1.0, 8
+        mapping: Dict[str, dict] = {}
+        error_msg = ""
+        use_response_format = True
+
+        for attempt in range(max_tries):
+            if self._stopped:
+                self.finished_signal.emit({}, "")
+                return
+            t_req_start = time.perf_counter()
+            try:
+                kwargs = {}
+                if use_response_format:
+                    kwargs["response_format"] = {"type": "json_object"}
+                resp = client.chat.completions.create(
+                    model=self.model_name,
+                    messages=messages,
+                    temperature=0.25,
+                    **kwargs,
+                )
+                txt = resp.choices[0].message.content if resp.choices else ""
+                clean = _strip_json_fence(txt or "")
+                mapping = json.loads(clean)
+                debug_log(
+                    f"openai_batch request_ms={int((time.perf_counter() - t_req_start) * 1000)} "
+                    f"attempts={attempt + 1} items={len(mapping)} response_format={use_response_format}"
+                )
+                break
+            except json.JSONDecodeError as e:
+                err_txt = str(e)
+                if "Expecting value" in err_txt and "char 0" in err_txt:
+                    error_msg = (
+                        "[Error] OpenAI produced no output. Switch model and try again."
+                    )
+                else:
+                    error_msg = (
+                        "[Error] OpenAI output was invalid. Retry or switch model."
+                    )
+                mapping = {}
+                debug_log(f"openai_batch error attempt={attempt + 1} error={err_txt}")
+                break
+            except Exception as e:
+                err_txt = str(e)
+                if use_response_format and "response_format" in err_txt:
+                    use_response_format = False
+                    debug_log("openai_batch response_format_unsupported")
+                    continue
+                if attempt == max_tries - 1 or not _is_retryable_openai_error(e):
+                    print("OpenAI batch error:", err_txt)
+                    error_msg = f"[OpenAI error => {err_txt}]"
+                    mapping = {}
+                    debug_log(f"openai_batch error attempt={attempt + 1} error={err_txt}")
+                    break
+                debug_log(f"openai_batch retry attempt={attempt + 1} error={err_txt}")
+                time.sleep(backoff + random.uniform(0, 0.5))
+                backoff *= 2
+
+        debug_log(f"openai_batch total_ms={int((time.perf_counter() - t_start) * 1000)} items={len(mapping)}")
 
         for p in crop_paths:
             try:

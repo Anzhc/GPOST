@@ -151,7 +151,8 @@ class TranslationOverlay(QWidget):
                 stroker.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
                 path = path.united(stroker.createStroke(path)).simplified()
             rect = path.boundingRect().toRect()
-            return path, rect, [pt for pt in path.toFillPolygon()]
+            poly_pts = [(pt.x(), pt.y()) for pt in path.toFillPolygon()]
+            return path, rect, poly_pts
 
         def centre_of(path: QPainterPath) -> QPointF:
             r = path.boundingRect()
@@ -257,8 +258,7 @@ class TranslationOverlay(QWidget):
             if rect.width() > bounding_rect.width() or rect.height() > bounding_rect.height():
                 return False
             if poly_ok and polygon is not None:
-                pts = [(p.x(), p.y()) for p in polygon]
-                return rect_in_polygon(rect, pts)
+                return rect_in_polygon(rect, polygon)
             return True
 
         low, high = MIN_PT, MAX_PT
@@ -293,7 +293,7 @@ class TranslationOverlay(QWidget):
 
         if polygon is not None:
             # Evaluate polygon fit but ignore the result to allow overflow
-            rect_in_polygon(best_rect, [(p.x(), p.y()) for p in polygon])
+            rect_in_polygon(best_rect, polygon)
 
         painter.setFont(best_font)
         outline_offsets = [
