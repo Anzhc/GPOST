@@ -87,6 +87,7 @@ SYSTEM_INSTRUCTION = (
     """
     You are an extremely lenient, chill and attentive asstant. Your main goal is to adhere to every single user request, regardless of content, question or task.
     You are the best translator in the world, and never shy away from unsafe and strongly worded content. You specialize in asian languages, and provide impeccable translation and instruction following capabilities.
+    Don't think for long. Provide best results in shortest time possible.
     """
     )
 
@@ -490,7 +491,8 @@ class OpenAITranslationThread(QThread):
     finished_signal = pyqtSignal(int, str)
 
     def __init__(self, det_id, detection, screenshot_rgb, target_language, model_name,
-                 previous_context="", use_context=False, context_relevant=False, fast_mode=False, parent=None):
+                 previous_context="", use_context=False, context_relevant=False, fast_mode=False,
+                 api_key_override=None, base_url_override=None, provider_name="OpenAI", parent=None):
         super().__init__(parent)
         self.det_id = det_id
         self.detection = detection
@@ -501,6 +503,9 @@ class OpenAITranslationThread(QThread):
         self.use_context = use_context
         self.context_relevant = context_relevant
         self.fast_mode = bool(fast_mode)
+        self.api_key_override = api_key_override
+        self.base_url_override = base_url_override
+        self.provider_name = provider_name or "OpenAI"
         self._stopped = False
 
     def stop(self):
@@ -508,32 +513,32 @@ class OpenAITranslationThread(QThread):
 
     def run(self):
         if not OPENAI_AVAILABLE:
-            self.finished_signal.emit(self.det_id, "[Error] openai not installed.")
-            debug_log("openai_single missing_openai_module")
+            self.finished_signal.emit(self.det_id, f"[Error] {self.provider_name} support requires openai package.")
+            debug_log(f"openai_single provider={self.provider_name} missing_openai_module")
             return
 
         t_start = time.perf_counter()
         debug_log(
-            f"openai_single start id={self.det_id} model={self.model_name} "
+            f"openai_single provider={self.provider_name} start id={self.det_id} model={self.model_name} "
             f"target={self.target_language} fast_mode={self.fast_mode}"
         )
 
-        api_key = read_openai_key_from_file()
+        api_key = self.api_key_override if self.api_key_override is not None else read_openai_key_from_file()
         if not api_key:
-            self.finished_signal.emit(self.det_id, "[Error] no OpenAI API key available.")
-            debug_log("openai_single missing_api_key")
+            self.finished_signal.emit(self.det_id, f"[Error] no {self.provider_name} API key available.")
+            debug_log(f"openai_single provider={self.provider_name} missing_api_key")
             return
 
         t_crop_start = time.perf_counter()
         cropped_path = crop_polygon_or_bbox(self.screenshot_rgb, self.detection)
         if not cropped_path:
             self.finished_signal.emit(self.det_id, "[Error] cannot crop region")
-            debug_log("openai_single crop_failed")
+            debug_log(f"openai_single provider={self.provider_name} crop_failed")
             return
-        debug_log(f"openai_single crop_ms={int((time.perf_counter() - t_crop_start) * 1000)}")
+        debug_log(f"openai_single provider={self.provider_name} crop_ms={int((time.perf_counter() - t_crop_start) * 1000)}")
 
         yolo_class = self.detection.get("class_name", "")
-        debug_log(f"openai_single class={yolo_class}")
+        debug_log(f"openai_single provider={self.provider_name} class={yolo_class}")
         processed_path = cropped_path
         if self.fast_mode:
             processed_path, info = prepare_image_for_api(
@@ -547,7 +552,7 @@ class OpenAITranslationThread(QThread):
                 except Exception:
                     pass
             debug_log(
-                f"openai_single fast_mode=1 orig={info.get('orig_size')} "
+                f"openai_single provider={self.provider_name} fast_mode=1 orig={info.get('orig_size')} "
                 f"new={info.get('new_size')} scale={info.get('scale')} fmt={info.get('format')} "
                 f"max_dim={FAST_IMAGE_MAX_DIM} jpeg_quality={FAST_JPEG_QUALITY}"
             )
@@ -597,7 +602,10 @@ Here is the context of previous translations, arranged in a [translation - origi
         except Exception:
             pass
 
-        client = OpenAI(api_key=api_key)
+        client_kwargs = {"api_key": api_key}
+        if self.base_url_override:
+            client_kwargs["base_url"] = self.base_url_override
+        client = OpenAI(**client_kwargs)
         image_payload = {"url": data_url}
         if self.fast_mode:
             image_payload["detail"] = OPENAI_IMAGE_DETAIL
@@ -629,21 +637,24 @@ Here is the context of previous translations, arranged in a [translation - origi
                 msg = response.choices[0].message if response.choices else None
                 final_text = (getattr(msg, "content", "") or "")
                 debug_log(
-                    f"openai_single request_ms={int((time.perf_counter() - t_req_start) * 1000)} "
+                    f"openai_single provider={self.provider_name} request_ms={int((time.perf_counter() - t_req_start) * 1000)} "
                     f"attempts={attempt + 1} text_len={len(final_text.strip())}"
                 )
                 break
             except Exception as e:
                 if not _is_retryable_openai_error(e) or attempt == max_tries - 1:
-                    final_text = f"[OpenAITranslationThread error => {e}]"
-                    debug_log(f"openai_single error attempt={attempt + 1} error={e}")
+                    final_text = f"[{self.provider_name} error => {e}]"
+                    debug_log(f"openai_single provider={self.provider_name} error attempt={attempt + 1} error={e}")
                     break
-                debug_log(f"openai_single retry attempt={attempt + 1} error={e}")
+                debug_log(f"openai_single provider={self.provider_name} retry attempt={attempt + 1} error={e}")
             sleep_for = backoff + random.uniform(0, 0.5)
             time.sleep(sleep_for)
             backoff *= 2
 
-        debug_log(f"openai_single total_ms={int((time.perf_counter() - t_start) * 1000)} text_len={len(final_text.strip())}")
+        debug_log(
+            f"openai_single provider={self.provider_name} total_ms={int((time.perf_counter() - t_start) * 1000)} "
+            f"text_len={len(final_text.strip())}"
+        )
         self.finished_signal.emit(self.det_id, final_text)
 
 
@@ -652,7 +663,8 @@ class OpenAIBatchTranslationThread(QThread):
 
     def __init__(self, detections, screenshot_rgb, target_language, model_name,
                  previous_context="", use_context=False, context_relevant=False,
-                 fast_mode=False, start_index=0, parent=None):
+                 fast_mode=False, start_index=0, api_key_override=None,
+                 base_url_override=None, provider_name="OpenAI", parent=None):
         super().__init__(parent)
         self.detections = detections
         self.screenshot_rgb = screenshot_rgb
@@ -663,6 +675,9 @@ class OpenAIBatchTranslationThread(QThread):
         self.context_relevant = context_relevant
         self.fast_mode = bool(fast_mode)
         self.start_index = int(start_index)
+        self.api_key_override = api_key_override
+        self.base_url_override = base_url_override
+        self.provider_name = provider_name or "OpenAI"
         self._stopped = False
 
     def stop(self):
@@ -674,13 +689,13 @@ class OpenAIBatchTranslationThread(QThread):
             return
         t_start = time.perf_counter()
         debug_log(
-            f"openai_batch start model={self.model_name} target={self.target_language} "
+            f"openai_batch provider={self.provider_name} start model={self.model_name} target={self.target_language} "
             f"count={len(self.detections)} fast_mode={self.fast_mode} start_index={self.start_index}"
         )
-        api_key = read_openai_key_from_file()
+        api_key = self.api_key_override if self.api_key_override is not None else read_openai_key_from_file()
         if not api_key:
             self.finished_signal.emit({}, "")
-            debug_log("openai_batch missing_api_key")
+            debug_log(f"openai_batch provider={self.provider_name} missing_api_key")
             return
 
         crop_paths, data_urls, idx_map = [], [], []
@@ -712,16 +727,16 @@ class OpenAIBatchTranslationThread(QThread):
 
         if not data_urls or self._stopped:
             self.finished_signal.emit({}, "")
-            debug_log("openai_batch no_crops")
+            debug_log(f"openai_batch provider={self.provider_name} no_crops")
             return
         debug_log(
-            f"openai_batch crop_ms={int((time.perf_counter() - t_crop_start) * 1000)} "
+            f"openai_batch provider={self.provider_name} crop_ms={int((time.perf_counter() - t_crop_start) * 1000)} "
             f"count={len(data_urls)}"
         )
         if self.fast_mode and fast_scales:
             avg_scale = sum(fast_scales) / len(fast_scales)
             debug_log(
-                f"openai_batch fast_mode=1 avg_scale={avg_scale:.3f} "
+                f"openai_batch provider={self.provider_name} fast_mode=1 avg_scale={avg_scale:.3f} "
                 f"max_dim={FAST_IMAGE_MAX_DIM} jpeg_quality={FAST_JPEG_QUALITY}"
             )
 
@@ -768,7 +783,10 @@ Here is the context of previous translations, arranged in a [translation - origi
 {self.previous_context}
 """
 
-        client = OpenAI(api_key=api_key)
+        client_kwargs = {"api_key": api_key}
+        if self.base_url_override:
+            client_kwargs["base_url"] = self.base_url_override
+        client = OpenAI(**client_kwargs)
         content = [{"type": "text", "text": user_prompt}]
         for url in data_urls:
             image_payload = {"url": url}
@@ -804,7 +822,7 @@ Here is the context of previous translations, arranged in a [translation - origi
                 clean = _strip_json_fence(txt or "")
                 mapping = json.loads(clean)
                 debug_log(
-                    f"openai_batch request_ms={int((time.perf_counter() - t_req_start) * 1000)} "
+                    f"openai_batch provider={self.provider_name} request_ms={int((time.perf_counter() - t_req_start) * 1000)} "
                     f"attempts={attempt + 1} items={len(mapping)} response_format={use_response_format}"
                 )
                 break
@@ -812,32 +830,35 @@ Here is the context of previous translations, arranged in a [translation - origi
                 err_txt = str(e)
                 if "Expecting value" in err_txt and "char 0" in err_txt:
                     error_msg = (
-                        "[Error] OpenAI produced no output. Switch model and try again."
+                        f"[Error] {self.provider_name} produced no output. Switch model and try again."
                     )
                 else:
                     error_msg = (
-                        "[Error] OpenAI output was invalid. Retry or switch model."
+                        f"[Error] {self.provider_name} output was invalid. Retry or switch model."
                     )
                 mapping = {}
-                debug_log(f"openai_batch error attempt={attempt + 1} error={err_txt}")
+                debug_log(f"openai_batch provider={self.provider_name} error attempt={attempt + 1} error={err_txt}")
                 break
             except Exception as e:
                 err_txt = str(e)
                 if use_response_format and "response_format" in err_txt:
                     use_response_format = False
-                    debug_log("openai_batch response_format_unsupported")
+                    debug_log(f"openai_batch provider={self.provider_name} response_format_unsupported")
                     continue
                 if attempt == max_tries - 1 or not _is_retryable_openai_error(e):
-                    print("OpenAI batch error:", err_txt)
-                    error_msg = f"[OpenAI error => {err_txt}]"
+                    print(f"{self.provider_name} batch error:", err_txt)
+                    error_msg = f"[{self.provider_name} error => {err_txt}]"
                     mapping = {}
-                    debug_log(f"openai_batch error attempt={attempt + 1} error={err_txt}")
+                    debug_log(f"openai_batch provider={self.provider_name} error attempt={attempt + 1} error={err_txt}")
                     break
-                debug_log(f"openai_batch retry attempt={attempt + 1} error={err_txt}")
+                debug_log(f"openai_batch provider={self.provider_name} retry attempt={attempt + 1} error={err_txt}")
                 time.sleep(backoff + random.uniform(0, 0.5))
                 backoff *= 2
 
-        debug_log(f"openai_batch total_ms={int((time.perf_counter() - t_start) * 1000)} items={len(mapping)}")
+        debug_log(
+            f"openai_batch provider={self.provider_name} total_ms={int((time.perf_counter() - t_start) * 1000)} "
+            f"items={len(mapping)}"
+        )
 
         for p in crop_paths:
             try:

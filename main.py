@@ -2,6 +2,10 @@ import sys
 import math
 import os
 import time
+import json
+from collections import Counter
+from urllib import error as urllib_error
+from urllib import request as urllib_request
 import mss
 import numpy as np
 from ultralytics import YOLO
@@ -56,6 +60,11 @@ try:
 except Exception:
     Polygon = None
     SHAPELY_AVAILABLE = False
+
+
+LMSTUDIO_BASE_URL = os.getenv("LMSTUDIO_BASE_URL", "http://localhost:1234").strip().rstrip("/")
+LMSTUDIO_DISCOVERY_URL = f"{LMSTUDIO_BASE_URL}/api/v1/models"
+LMSTUDIO_OPENAI_BASE_URL = f"{LMSTUDIO_BASE_URL}/v1"
 
 
 class AutoAreaWorker(QThread):
@@ -122,6 +131,69 @@ class AutoAreaWorker(QThread):
                 self.msleep(250)
 
 
+class LMStudioDiscoveryWorker(QThread):
+    models_ready = pyqtSignal(list)
+
+    def run(self):
+        token = os.getenv("LM_API_TOKEN", "").strip()
+        headers = {}
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
+        req = urllib_request.Request(LMSTUDIO_DISCOVERY_URL, headers=headers, method="GET")
+        try:
+            with urllib_request.urlopen(req, timeout=2.5) as resp:
+                status = getattr(resp, "status", None) or resp.getcode()
+                if status != 200:
+                    msg = f"lmstudio_discovery unavailable url={LMSTUDIO_DISCOVERY_URL} status={status}"
+                    print(f"[LM Studio] {msg}")
+                    debug_log(msg)
+                    self.models_ready.emit([])
+                    return
+                payload = json.load(resp)
+        except urllib_error.URLError as e:
+            msg = f"lmstudio_discovery unavailable url={LMSTUDIO_DISCOVERY_URL} error={e}"
+            print(f"[LM Studio] {msg}")
+            debug_log(msg)
+            self.models_ready.emit([])
+            return
+        except json.JSONDecodeError as e:
+            msg = f"lmstudio_discovery invalid_json url={LMSTUDIO_DISCOVERY_URL} error={e}"
+            print(f"[LM Studio] {msg}")
+            debug_log(msg)
+            self.models_ready.emit([])
+            return
+        except Exception as e:
+            msg = f"lmstudio_discovery unavailable url={LMSTUDIO_DISCOVERY_URL} error={e}"
+            print(f"[LM Studio] {msg}")
+            debug_log(msg)
+            self.models_ready.emit([])
+            return
+
+        available = []
+        for model in payload.get("models", []):
+            if model.get("type") != "llm":
+                continue
+            if not model.get("capabilities", {}).get("vision"):
+                continue
+            loaded_instances = model.get("loaded_instances") or []
+            if not loaded_instances:
+                continue
+            display_name = (model.get("display_name") or model.get("key") or "Unknown model").strip()
+            for inst in loaded_instances:
+                instance_id = (inst.get("id") or "").strip()
+                if not instance_id:
+                    continue
+                available.append({
+                    "display_name": display_name,
+                    "instance_id": instance_id,
+                })
+
+        msg = f"lmstudio_discovery available count={len(available)}"
+        print(f"[LM Studio] {msg}")
+        debug_log(msg)
+        self.models_ready.emit(available)
+
+
 class MainWindow(QMainWindow):
     requestRunInference = pyqtSignal()
     requestTranslate = pyqtSignal()
@@ -172,6 +244,7 @@ class MainWindow(QMainWindow):
         self.live_page_mode = True
         self.live_page_diff_threshold = 0.04
         self.live_page_sig_size = 32
+        self.lmstudio_discovery_thread = None
 
         self.init_ui()
         mp = prepare_latest_model()
@@ -197,6 +270,8 @@ class MainWindow(QMainWindow):
 
         # Auto area background worker (started when enabled)
         self.auto_area_thread = None
+
+        self.start_lmstudio_discovery()
 
         if KEYBOARD_AVAILABLE:
             self.register_global_hotkeys()
@@ -466,6 +541,47 @@ class MainWindow(QMainWindow):
 
         self.class_checkboxes = {}
         self.monitor_combo.currentIndexChanged.connect(self.on_monitor_changed)
+
+    def start_lmstudio_discovery(self):
+        if self.lmstudio_discovery_thread and self.lmstudio_discovery_thread.isRunning():
+            return
+        self.lmstudio_discovery_thread = LMStudioDiscoveryWorker(self)
+        self.lmstudio_discovery_thread.models_ready.connect(self.on_lmstudio_models_ready)
+        self.lmstudio_discovery_thread.finished.connect(self._on_lmstudio_discovery_finished)
+        self.lmstudio_discovery_thread.start()
+
+    @pyqtSlot(list)
+    def on_lmstudio_models_ready(self, models):
+        if not models:
+            debug_log("lmstudio_models_added count=0")
+            return
+        existing_ids = {
+            data[1]
+            for i in range(self.model_combo.count())
+            if isinstance((data := self.model_combo.itemData(i)), tuple)
+            and len(data) == 2
+            and data[0] == "lmstudio"
+        }
+        name_counts = Counter(item.get("display_name", "") for item in models)
+        added = 0
+        for item in models:
+            instance_id = item.get("instance_id", "")
+            if not instance_id or instance_id in existing_ids:
+                continue
+            display_name = item.get("display_name") or instance_id
+            label = f"LM Studio: {display_name}"
+            if name_counts.get(display_name, 0) > 1:
+                label = f"{label} ({instance_id})"
+            self.model_combo.addItem(label, ("lmstudio", instance_id))
+            existing_ids.add(instance_id)
+            added += 1
+        debug_log(f"lmstudio_models_added count={added}")
+        if added:
+            print(f"[LM Studio] Added {added} active vision model(s).")
+
+    @pyqtSlot()
+    def _on_lmstudio_discovery_finished(self):
+        self.lmstudio_discovery_thread = None
 
     # ------------------------------------------------------------------
     def register_global_hotkeys(self):
@@ -1449,7 +1565,12 @@ class MainWindow(QMainWindow):
             provider, model_name = model_entry
         else:
             model_name = (self.model_combo.currentText() or '').strip()
-            provider = 'gemini' if model_name.startswith('gemini-') else 'openai'
+            if model_name.startswith('gemini-'):
+                provider = 'gemini'
+            elif model_name.startswith('LM Studio:'):
+                provider = 'lmstudio'
+            else:
+                provider = 'openai'
 
         if provider == 'gemini':
             if not GEMINI_AVAILABLE:
@@ -1461,6 +1582,9 @@ class MainWindow(QMainWindow):
                 QMessageBox.warning(self, 'OpenAI missing', 'openai not installed!'); return
             if not self._check_openai_key():
                 return
+        elif provider == 'lmstudio':
+            if not OPENAI_AVAILABLE:
+                QMessageBox.warning(self, 'LM Studio missing dependency', 'LM Studio support requires openai package.'); return
         else:
             QMessageBox.warning(self, 'Model error', 'Unknown model provider.'); return
 
@@ -1503,7 +1627,18 @@ class MainWindow(QMainWindow):
         if self.detection_overlay:
             self.detection_overlay.hide()
         tgt_lang = self.language_combo.currentText()
-        provider_label = 'Gemini' if provider == 'gemini' else 'OpenAI'
+        provider_label = {
+            'gemini': 'Gemini',
+            'openai': 'OpenAI',
+            'lmstudio': 'LM Studio',
+        }.get(provider, provider)
+        openai_kwargs = {}
+        if provider == 'lmstudio':
+            openai_kwargs = {
+                'api_key_override': os.getenv('LM_API_TOKEN', '').strip() or 'lm-studio',
+                'base_url_override': LMSTUDIO_OPENAI_BASE_URL,
+                'provider_name': 'LM Studio',
+            }
 
         ctx_enabled = self.context_check.isChecked()
         ctx_num = self.context_spin.value()
@@ -1545,6 +1680,7 @@ class MainWindow(QMainWindow):
                         context_relevant=ctx_relevant,
                         fast_mode=fast_mode,
                         start_index=start,
+                        **openai_kwargs,
                     )
                 thr.finished_signal.connect(self.on_batch_results)
                 thr.start()
@@ -1579,6 +1715,7 @@ class MainWindow(QMainWindow):
                         use_context=ctx_enabled,
                         context_relevant=ctx_relevant,
                         fast_mode=fast_mode,
+                        **openai_kwargs,
                     )
                 thr.finished_signal.connect(self.on_final_result)
                 thr.start()
@@ -1891,6 +2028,8 @@ class MainWindow(QMainWindow):
         print('[MainWindow] closeEvent => stopping threads and overlays.')
         self.close_overlays()
         self._stop_auto_area_worker()
+        if self.lmstudio_discovery_thread and self.lmstudio_discovery_thread.isRunning():
+            self.lmstudio_discovery_thread.wait(100)
         if self.region_select_overlay:
             self.region_select_overlay.close()
             self.region_select_overlay = None
