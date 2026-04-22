@@ -8,6 +8,8 @@ import sys
 import base64
 from typing import Dict
 from pathlib import Path
+from urllib import error as urllib_error
+from urllib import request as urllib_request
 import numpy as np
 import queue
 import asyncio
@@ -72,7 +74,7 @@ except Exception:
 
 try:
     import torch
-except ImportError:
+except Exception:
     torch = None
 
 def wave_file(filename, pcm, channels=1, rate=24000, sample_width=2):
@@ -94,6 +96,7 @@ SYSTEM_INSTRUCTION = (
 FAST_IMAGE_MAX_DIM = 384
 FAST_JPEG_QUALITY = 70
 OPENAI_IMAGE_DETAIL = "low"
+LMSTUDIO_HTTP_TIMEOUT_SEC = 180
 
 
 if GEMINI_AVAILABLE:
@@ -119,6 +122,80 @@ def _is_retryable_openai_error(exc: Exception) -> bool:
         return True
     status = getattr(exc, "status_code", None)
     return status in (429, 500, 502, 503, 504)
+
+
+class LMStudioRESTError(Exception):
+    def __init__(self, status_code, body):
+        self.status_code = status_code
+        self.body = body or ""
+        if status_code is None:
+            msg = self.body or "LM Studio REST request failed."
+        else:
+            msg = f"HTTP {status_code}: {self.body or 'LM Studio REST request failed.'}"
+        super().__init__(msg)
+
+
+def _is_retryable_lmstudio_error(exc: Exception) -> bool:
+    status = getattr(exc, "status_code", None)
+    return status in (429, 500, 502, 503, 504)
+
+
+def _lmstudio_rest_chat(
+    endpoint_url: str,
+    api_key: str,
+    model: str,
+    user_prompt: str,
+    data_urls: list[str],
+    temperature: float = 0.25,
+):
+    payload = {
+        "model": model,
+        "input": [{"type": "text", "content": user_prompt}],
+        "system_prompt": SYSTEM_INSTRUCTION.strip(),
+        "temperature": temperature,
+        "stream": False,
+        "store": False,
+    }
+    for data_url in data_urls:
+        payload["input"].append({"type": "image", "data_url": data_url})
+
+    headers = {"Content-Type": "application/json"}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+
+    req = urllib_request.Request(
+        endpoint_url,
+        data=json.dumps(payload).encode("utf-8"),
+        headers=headers,
+        method="POST",
+    )
+    try:
+        with urllib_request.urlopen(req, timeout=LMSTUDIO_HTTP_TIMEOUT_SEC) as resp:
+            raw = resp.read().decode("utf-8")
+    except urllib_error.HTTPError as e:
+        body = e.read().decode("utf-8", errors="replace")
+        raise LMStudioRESTError(e.code, body) from e
+    except urllib_error.URLError as e:
+        raise LMStudioRESTError(None, str(e)) from e
+
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError as e:
+        raise LMStudioRESTError(None, f"Invalid JSON response: {e}") from e
+
+
+def _extract_lmstudio_rest_text(payload: dict) -> str:
+    output = payload.get("output") or []
+    parts = []
+    for item in output:
+        if not isinstance(item, dict):
+            continue
+        if item.get("type") != "message":
+            continue
+        content = item.get("content") or ""
+        if isinstance(content, str):
+            parts.append(content)
+    return "\n".join(part for part in parts if part).strip()
 
 
 def _image_path_to_data_url(path: str) -> str:
@@ -492,7 +569,8 @@ class OpenAITranslationThread(QThread):
 
     def __init__(self, det_id, detection, screenshot_rgb, target_language, model_name,
                  previous_context="", use_context=False, context_relevant=False, fast_mode=False,
-                 api_key_override=None, base_url_override=None, provider_name="OpenAI", parent=None):
+                 api_key_override=None, base_url_override=None, provider_name="OpenAI",
+                 use_rest_api=False, rest_endpoint_override=None, parent=None):
         super().__init__(parent)
         self.det_id = det_id
         self.detection = detection
@@ -506,13 +584,15 @@ class OpenAITranslationThread(QThread):
         self.api_key_override = api_key_override
         self.base_url_override = base_url_override
         self.provider_name = provider_name or "OpenAI"
+        self.use_rest_api = bool(use_rest_api)
+        self.rest_endpoint_override = rest_endpoint_override
         self._stopped = False
 
     def stop(self):
         self._stopped = True
 
     def run(self):
-        if not OPENAI_AVAILABLE:
+        if not self.use_rest_api and not OPENAI_AVAILABLE:
             self.finished_signal.emit(self.det_id, f"[Error] {self.provider_name} support requires openai package.")
             debug_log(f"openai_single provider={self.provider_name} missing_openai_module")
             return
@@ -602,23 +682,27 @@ Here is the context of previous translations, arranged in a [translation - origi
         except Exception:
             pass
 
-        client_kwargs = {"api_key": api_key}
-        if self.base_url_override:
-            client_kwargs["base_url"] = self.base_url_override
-        client = OpenAI(**client_kwargs)
-        image_payload = {"url": data_url}
-        if self.fast_mode:
-            image_payload["detail"] = OPENAI_IMAGE_DETAIL
-        messages = [
-            {"role": "system", "content": SYSTEM_INSTRUCTION},
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": user_prompt},
-                    {"type": "image_url", "image_url": image_payload},
-                ],
-            },
-        ]
+        client = None
+        if self.use_rest_api:
+            rest_endpoint = self.rest_endpoint_override
+        else:
+            client_kwargs = {"api_key": api_key}
+            if self.base_url_override:
+                client_kwargs["base_url"] = self.base_url_override
+            client = OpenAI(**client_kwargs)
+            image_payload = {"url": data_url}
+            if self.fast_mode:
+                image_payload["detail"] = OPENAI_IMAGE_DETAIL
+            messages = [
+                {"role": "system", "content": SYSTEM_INSTRUCTION},
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": user_prompt},
+                        {"type": "image_url", "image_url": image_payload},
+                    ],
+                },
+            ]
 
         backoff = 1.0
         max_tries = 10
@@ -629,20 +713,32 @@ Here is the context of previous translations, arranged in a [translation - origi
                 return
             t_req_start = time.perf_counter()
             try:
-                response = client.chat.completions.create(
-                    model=self.model_name,
-                    messages=messages,
-                    temperature=0.25,
-                )
-                msg = response.choices[0].message if response.choices else None
-                final_text = (getattr(msg, "content", "") or "")
+                if self.use_rest_api:
+                    response = _lmstudio_rest_chat(
+                        endpoint_url=rest_endpoint,
+                        api_key=api_key,
+                        model=self.model_name,
+                        user_prompt=user_prompt,
+                        data_urls=[data_url],
+                        temperature=0.25,
+                    )
+                    final_text = _extract_lmstudio_rest_text(response)
+                else:
+                    response = client.chat.completions.create(
+                        model=self.model_name,
+                        messages=messages,
+                        temperature=0.25,
+                    )
+                    msg = response.choices[0].message if response.choices else None
+                    final_text = (getattr(msg, "content", "") or "")
                 debug_log(
                     f"openai_single provider={self.provider_name} request_ms={int((time.perf_counter() - t_req_start) * 1000)} "
                     f"attempts={attempt + 1} text_len={len(final_text.strip())}"
                 )
                 break
             except Exception as e:
-                if not _is_retryable_openai_error(e) or attempt == max_tries - 1:
+                is_retryable = _is_retryable_lmstudio_error(e) if self.use_rest_api else _is_retryable_openai_error(e)
+                if not is_retryable or attempt == max_tries - 1:
                     final_text = f"[{self.provider_name} error => {e}]"
                     debug_log(f"openai_single provider={self.provider_name} error attempt={attempt + 1} error={e}")
                     break
@@ -664,7 +760,8 @@ class OpenAIBatchTranslationThread(QThread):
     def __init__(self, detections, screenshot_rgb, target_language, model_name,
                  previous_context="", use_context=False, context_relevant=False,
                  fast_mode=False, start_index=0, api_key_override=None,
-                 base_url_override=None, provider_name="OpenAI", parent=None):
+                 base_url_override=None, provider_name="OpenAI",
+                 use_rest_api=False, rest_endpoint_override=None, parent=None):
         super().__init__(parent)
         self.detections = detections
         self.screenshot_rgb = screenshot_rgb
@@ -678,13 +775,15 @@ class OpenAIBatchTranslationThread(QThread):
         self.api_key_override = api_key_override
         self.base_url_override = base_url_override
         self.provider_name = provider_name or "OpenAI"
+        self.use_rest_api = bool(use_rest_api)
+        self.rest_endpoint_override = rest_endpoint_override
         self._stopped = False
 
     def stop(self):
         self._stopped = True
 
     def run(self):
-        if not OPENAI_AVAILABLE or self._stopped:
+        if (not self.use_rest_api and not OPENAI_AVAILABLE) or self._stopped:
             self.finished_signal.emit({}, "")
             return
         t_start = time.perf_counter()
@@ -783,25 +882,29 @@ Here is the context of previous translations, arranged in a [translation - origi
 {self.previous_context}
 """
 
-        client_kwargs = {"api_key": api_key}
-        if self.base_url_override:
-            client_kwargs["base_url"] = self.base_url_override
-        client = OpenAI(**client_kwargs)
-        content = [{"type": "text", "text": user_prompt}]
-        for url in data_urls:
-            image_payload = {"url": url}
-            if self.fast_mode:
-                image_payload["detail"] = OPENAI_IMAGE_DETAIL
-            content.append({"type": "image_url", "image_url": image_payload})
-        messages = [
-            {"role": "system", "content": SYSTEM_INSTRUCTION},
-            {"role": "user", "content": content},
-        ]
+        client = None
+        if self.use_rest_api:
+            rest_endpoint = self.rest_endpoint_override
+        else:
+            client_kwargs = {"api_key": api_key}
+            if self.base_url_override:
+                client_kwargs["base_url"] = self.base_url_override
+            client = OpenAI(**client_kwargs)
+            content = [{"type": "text", "text": user_prompt}]
+            for url in data_urls:
+                image_payload = {"url": url}
+                if self.fast_mode:
+                    image_payload["detail"] = OPENAI_IMAGE_DETAIL
+                content.append({"type": "image_url", "image_url": image_payload})
+            messages = [
+                {"role": "system", "content": SYSTEM_INSTRUCTION},
+                {"role": "user", "content": content},
+            ]
 
         backoff, max_tries = 1.0, 8
         mapping: Dict[str, dict] = {}
         error_msg = ""
-        use_response_format = True
+        use_response_format = not self.use_rest_api
 
         for attempt in range(max_tries):
             if self._stopped:
@@ -809,16 +912,27 @@ Here is the context of previous translations, arranged in a [translation - origi
                 return
             t_req_start = time.perf_counter()
             try:
-                kwargs = {}
-                if use_response_format:
-                    kwargs["response_format"] = {"type": "json_object"}
-                resp = client.chat.completions.create(
-                    model=self.model_name,
-                    messages=messages,
-                    temperature=0.25,
-                    **kwargs,
-                )
-                txt = resp.choices[0].message.content if resp.choices else ""
+                if self.use_rest_api:
+                    resp = _lmstudio_rest_chat(
+                        endpoint_url=rest_endpoint,
+                        api_key=api_key,
+                        model=self.model_name,
+                        user_prompt=user_prompt,
+                        data_urls=data_urls,
+                        temperature=0.25,
+                    )
+                    txt = _extract_lmstudio_rest_text(resp)
+                else:
+                    kwargs = {}
+                    if use_response_format:
+                        kwargs["response_format"] = {"type": "json_object"}
+                    resp = client.chat.completions.create(
+                        model=self.model_name,
+                        messages=messages,
+                        temperature=0.25,
+                        **kwargs,
+                    )
+                    txt = resp.choices[0].message.content if resp.choices else ""
                 clean = _strip_json_fence(txt or "")
                 mapping = json.loads(clean)
                 debug_log(
@@ -841,11 +955,12 @@ Here is the context of previous translations, arranged in a [translation - origi
                 break
             except Exception as e:
                 err_txt = str(e)
-                if use_response_format and "response_format" in err_txt:
+                if not self.use_rest_api and use_response_format and "response_format" in err_txt:
                     use_response_format = False
                     debug_log(f"openai_batch provider={self.provider_name} response_format_unsupported")
                     continue
-                if attempt == max_tries - 1 or not _is_retryable_openai_error(e):
+                is_retryable = _is_retryable_lmstudio_error(e) if self.use_rest_api else _is_retryable_openai_error(e)
+                if attempt == max_tries - 1 or not is_retryable:
                     print(f"{self.provider_name} batch error:", err_txt)
                     error_msg = f"[{self.provider_name} error => {err_txt}]"
                     mapping = {}

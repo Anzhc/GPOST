@@ -64,7 +64,7 @@ except Exception:
 
 LMSTUDIO_BASE_URL = os.getenv("LMSTUDIO_BASE_URL", "http://localhost:1234").strip().rstrip("/")
 LMSTUDIO_DISCOVERY_URL = f"{LMSTUDIO_BASE_URL}/api/v1/models"
-LMSTUDIO_OPENAI_BASE_URL = f"{LMSTUDIO_BASE_URL}/v1"
+LMSTUDIO_REST_CHAT_URL = f"{LMSTUDIO_BASE_URL}/api/v1/chat"
 
 
 class AutoAreaWorker(QThread):
@@ -1583,8 +1583,7 @@ class MainWindow(QMainWindow):
             if not self._check_openai_key():
                 return
         elif provider == 'lmstudio':
-            if not OPENAI_AVAILABLE:
-                QMessageBox.warning(self, 'LM Studio missing dependency', 'LM Studio support requires openai package.'); return
+            pass
         else:
             QMessageBox.warning(self, 'Model error', 'Unknown model provider.'); return
 
@@ -1636,8 +1635,9 @@ class MainWindow(QMainWindow):
         if provider == 'lmstudio':
             openai_kwargs = {
                 'api_key_override': os.getenv('LM_API_TOKEN', '').strip() or 'lm-studio',
-                'base_url_override': LMSTUDIO_OPENAI_BASE_URL,
                 'provider_name': 'LM Studio',
+                'use_rest_api': True,
+                'rest_endpoint_override': LMSTUDIO_REST_CHAT_URL,
             }
 
         ctx_enabled = self.context_check.isChecked()
@@ -1726,6 +1726,7 @@ class MainWindow(QMainWindow):
     @pyqtSlot(dict, str)
     def on_batch_results(self, mapping, error_msg):
         if error_msg:
+            self.translation_threads = [t for t in self.translation_threads if t.isRunning()]
             if self.live_trigger_active:
                 self.live_trigger_active = False
             self._log_console(error_msg)
