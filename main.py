@@ -5,6 +5,7 @@ import time
 import json
 from collections import Counter
 from urllib import error as urllib_error
+from urllib import parse as urllib_parse
 from urllib import request as urllib_request
 import mss
 import numpy as np
@@ -65,6 +66,7 @@ except Exception:
 LMSTUDIO_BASE_URL = os.getenv("LMSTUDIO_BASE_URL", "http://localhost:1234").strip().rstrip("/")
 LMSTUDIO_DISCOVERY_URL = f"{LMSTUDIO_BASE_URL}/api/v1/models"
 LMSTUDIO_REST_CHAT_URL = f"{LMSTUDIO_BASE_URL}/api/v1/chat"
+GEMINI_MODELS_URL = "https://generativelanguage.googleapis.com/v1beta/models"
 
 
 class AutoAreaWorker(QThread):
@@ -194,6 +196,91 @@ class LMStudioDiscoveryWorker(QThread):
         self.models_ready.emit(available)
 
 
+class GeminiModelDiscoveryWorker(QThread):
+    models_ready = pyqtSignal(list)
+
+    def __init__(self, api_key, parent=None):
+        super().__init__(parent)
+        self.api_key = (api_key or "").strip()
+
+    def run(self):
+        if not self.api_key:
+            debug_log("gemini_model_discovery missing_api_key")
+            self.models_ready.emit([])
+            return
+
+        available = []
+        seen = set()
+        page_token = ""
+        try:
+            while True:
+                params = {
+                    "key": self.api_key,
+                    "pageSize": "1000",
+                }
+                if page_token:
+                    params["pageToken"] = page_token
+                url = f"{GEMINI_MODELS_URL}?{urllib_parse.urlencode(params)}"
+                req = urllib_request.Request(
+                    url,
+                    headers={"Accept": "application/json"},
+                    method="GET",
+                )
+                with urllib_request.urlopen(req, timeout=8) as resp:
+                    status = getattr(resp, "status", None) or resp.getcode()
+                    if status != 200:
+                        debug_log(f"gemini_model_discovery status={status}")
+                        self.models_ready.emit([])
+                        return
+                    payload = json.load(resp)
+
+                for model in payload.get("models", []):
+                    if not isinstance(model, dict):
+                        continue
+                    methods = model.get("supportedGenerationMethods") or []
+                    if "generateContent" not in methods:
+                        continue
+                    raw_name = (model.get("name") or "").strip()
+                    model_id = raw_name.split("/", 1)[1] if raw_name.startswith("models/") else raw_name
+                    base_model_id = (model.get("baseModelId") or model_id).strip()
+                    if not model_id:
+                        continue
+                    if not (model_id.startswith("gemini-") or base_model_id.startswith("gemini-")):
+                        continue
+                    if model_id in seen:
+                        continue
+                    seen.add(model_id)
+                    available.append({
+                        "model_id": model_id,
+                        "base_model_id": base_model_id,
+                        "display_name": (model.get("displayName") or model_id).strip(),
+                    })
+
+                page_token = (payload.get("nextPageToken") or "").strip()
+                if not page_token:
+                    break
+        except urllib_error.HTTPError as e:
+            body = e.read().decode("utf-8", errors="replace").strip()
+            debug_log(f"gemini_model_discovery http_status={e.code} body={body[:300]}")
+            self.models_ready.emit([])
+            return
+        except urllib_error.URLError as e:
+            debug_log(f"gemini_model_discovery unavailable error={e}")
+            self.models_ready.emit([])
+            return
+        except json.JSONDecodeError as e:
+            debug_log(f"gemini_model_discovery invalid_json error={e}")
+            self.models_ready.emit([])
+            return
+        except Exception as e:
+            debug_log(f"gemini_model_discovery error={e}")
+            self.models_ready.emit([])
+            return
+
+        debug_log(f"gemini_model_discovery available count={len(available)}")
+        self.models_ready.emit(available)
+
+
 class MainWindow(QMainWindow):
     requestRunInference = pyqtSignal()
     requestTranslate = pyqtSignal()
@@ -245,6 +332,7 @@ class MainWindow(QMainWindow):
         self.live_page_diff_threshold = 0.04
         self.live_page_sig_size = 32
         self.lmstudio_discovery_thread = None
+        self.gemini_model_discovery_thread = None
 
         self.init_ui()
         mp = prepare_latest_model()
@@ -276,7 +364,10 @@ class MainWindow(QMainWindow):
         if KEYBOARD_AVAILABLE:
             self.register_global_hotkeys()
 
-        self._check_api_key()
+        if self._check_api_key():
+            self.start_gemini_model_discovery()
+        else:
+            self.on_gemini_models_ready([])
 
     # ------------------------------------------------------------------
     def init_ui(self):
@@ -383,22 +474,11 @@ class MainWindow(QMainWindow):
         left.addWidget(self.language_combo)
 
         self.model_combo = QComboBox()
-        gemini_models = [
-            "gemini-3-flash-preview",
-            "gemini-2.5-flash-preview-09-2025",
-            "gemini-2.5-flash",
-            "gemini-2.5-flash-lite",
-            "gemini-2.5-flash-lite-preview-09-2025",
-            "gemini-2.5-pro-preview-03-25",
-            "gemini-2.0-flash",
-            "gemini-2.0-flash-lite",
-        ]
-        for name in gemini_models:
-            self.model_combo.addItem(name, ("gemini", name))
+        self.model_combo.addItem("Gemini models loading...", ("gemini_loading", ""))
         self.model_combo.addItem("OpenAI GPT-4 Turbo", ("openai", "gpt-4-turbo"))
         self.model_combo.addItem("OpenAI GPT-4o", ("openai", "gpt-4o"))
         self.model_combo.addItem("OpenAI GPT-4o Mini", ("openai", "gpt-4o-mini"))
-        self.model_combo.setCurrentIndex(2)
+        self.model_combo.setCurrentIndex(0)
         left.addWidget(self.model_combo)
 
         self.btn_translate = QPushButton("Translate (ctrl+alt+G+H)")
@@ -427,6 +507,15 @@ class MainWindow(QMainWindow):
         mg.addWidget(QLabel("Font size offset (points, can be negative):"))
         self.font_offset_spin = QSpinBox(); self.font_offset_spin.setRange(-64,64); self.font_offset_spin.setValue(0)
         mg.addWidget(self.font_offset_spin)
+
+        self.overlay_opacity_label = QLabel("Overlay opacity: 71%")
+        mg.addWidget(self.overlay_opacity_label)
+        self.overlay_opacity_slider = QSlider(Qt.Orientation.Horizontal)
+        self.overlay_opacity_slider.setRange(0, 100)
+        self.overlay_opacity_slider.setTickInterval(5)
+        self.overlay_opacity_slider.setValue(71)
+        self.overlay_opacity_slider.valueChanged.connect(self.on_overlay_opacity_changed)
+        mg.addWidget(self.overlay_opacity_slider)
 
         self.merge_overlap_check = QCheckBox("Merge overlapping detections (larger box wins)")
         self.merge_overlap_check.setChecked(True)
@@ -542,6 +631,141 @@ class MainWindow(QMainWindow):
         self.class_checkboxes = {}
         self.monitor_combo.currentIndexChanged.connect(self.on_monitor_changed)
 
+    def _find_model_combo_data(self, target_data):
+        for i in range(self.model_combo.count()):
+            if self.model_combo.itemData(i) == target_data:
+                return i
+        return -1
+
+    def _remove_model_items_by_provider(self, providers):
+        providers = set(providers)
+        for i in range(self.model_combo.count() - 1, -1, -1):
+            data = self.model_combo.itemData(i)
+            if isinstance(data, tuple) and data and data[0] in providers:
+                self.model_combo.removeItem(i)
+
+    def _gemini_model_label(self, model):
+        model_id = model.get("model_id", "")
+        display_name = model.get("display_name") or model_id
+        if display_name and display_name != model_id:
+            return f"Gemini: {display_name} ({model_id})"
+        return f"Gemini: {model_id}"
+
+    def _gemini_tts_model_label(self, model):
+        model_id = model.get("model_id", "")
+        display_name = model.get("display_name") or model_id
+        if display_name and display_name != model_id:
+            return f"{display_name} ({model_id})"
+        return model_id
+
+    def _is_gemini_translation_model(self, model_id):
+        lower = (model_id or "").lower()
+        excluded = (
+            "embedding",
+            "imagen",
+            "veo",
+            "lyria",
+            "tts",
+            "aqa",
+            "image-generation",
+        )
+        return bool(model_id) and not any(token in lower for token in excluded)
+
+    def _is_gemini_tts_model(self, model_id):
+        return "tts" in (model_id or "").lower()
+
+    def _populate_gemini_tts_models(self, models):
+        if not hasattr(self, "gemini_model_combo"):
+            return
+        current_data = self.gemini_model_combo.currentData()
+        preferred_model = current_data or "gemini-2.5-flash-preview-tts"
+        self.gemini_model_combo.blockSignals(True)
+        self.gemini_model_combo.clear()
+        if models:
+            for model in models:
+                self.gemini_model_combo.addItem(
+                    self._gemini_tts_model_label(model),
+                    model["model_id"],
+                )
+            idx = self.gemini_model_combo.findData(preferred_model)
+            if idx < 0:
+                idx = self.gemini_model_combo.findData("gemini-2.5-flash-preview-tts")
+            self.gemini_model_combo.setCurrentIndex(idx if idx >= 0 else 0)
+            debug_log(f"gemini_tts_models_added count={len(models)}")
+        else:
+            self.gemini_model_combo.addItem("Gemini TTS models unavailable", "")
+            debug_log("gemini_tts_models_added count=0")
+        self.gemini_model_combo.blockSignals(False)
+
+    def start_gemini_model_discovery(self):
+        if self.gemini_model_discovery_thread and self.gemini_model_discovery_thread.isRunning():
+            return
+        api_key = read_api_key_from_file()
+        if not api_key:
+            self.on_gemini_models_ready([])
+            return
+        self.gemini_model_discovery_thread = GeminiModelDiscoveryWorker(api_key, self)
+        self.gemini_model_discovery_thread.models_ready.connect(self.on_gemini_models_ready)
+        self.gemini_model_discovery_thread.finished.connect(self._on_gemini_model_discovery_finished)
+        self.gemini_model_discovery_thread.start()
+
+    @pyqtSlot(list)
+    def on_gemini_models_ready(self, models):
+        current_data = self.model_combo.currentData()
+        current_provider = current_data[0] if isinstance(current_data, tuple) and current_data else None
+        current_model = current_data[1] if isinstance(current_data, tuple) and len(current_data) > 1 else ""
+        preserve_non_gemini = current_provider in ("openai", "lmstudio")
+
+        self._remove_model_items_by_provider({"gemini", "gemini_loading", "gemini_unavailable"})
+
+        gemini_models = [
+            model
+            for model in models
+            if self._is_gemini_translation_model(model.get("model_id", ""))
+        ]
+        gemini_tts_models = [
+            model
+            for model in models
+            if self._is_gemini_tts_model(model.get("model_id", ""))
+        ]
+        insert_at = 0
+        if gemini_models:
+            for model in gemini_models:
+                self.model_combo.insertItem(
+                    insert_at,
+                    self._gemini_model_label(model),
+                    ("gemini", model["model_id"]),
+                )
+                insert_at += 1
+            debug_log(f"gemini_models_added count={len(gemini_models)}")
+            print(f"[Gemini] Added {len(gemini_models)} available model(s).")
+        else:
+            self.model_combo.insertItem(
+                0,
+                "Gemini models unavailable",
+                ("gemini_unavailable", ""),
+            )
+            debug_log("gemini_models_added count=0")
+
+        self._populate_gemini_tts_models(gemini_tts_models)
+
+        if preserve_non_gemini:
+            idx = self._find_model_combo_data(current_data)
+            if idx >= 0:
+                self.model_combo.setCurrentIndex(idx)
+                return
+
+        preferred_model = current_model if current_provider == "gemini" else "gemini-2.5-flash"
+        idx = self._find_model_combo_data(("gemini", preferred_model))
+        if idx < 0 and gemini_models:
+            idx = 0
+        if idx >= 0:
+            self.model_combo.setCurrentIndex(idx)
+
+    @pyqtSlot()
+    def _on_gemini_model_discovery_finished(self):
+        self.gemini_model_discovery_thread = None
+
     def start_lmstudio_discovery(self):
         if self.lmstudio_discovery_thread and self.lmstudio_discovery_thread.isRunning():
             return
@@ -650,6 +874,12 @@ class MainWindow(QMainWindow):
         self.console_edit.setPlainText("\n".join(self.console_lines))
         self.console_edit.verticalScrollBar().setValue(self.console_edit.verticalScrollBar().maximum())
 
+    def _overlay_background_alpha(self):
+        value = 71
+        if hasattr(self, "overlay_opacity_slider"):
+            value = self.overlay_opacity_slider.value()
+        return int(round(max(0, min(100, value)) * 255 / 100))
+
     def _add_history(self, translation, original=""):
         entry = f"{translation} - {original}" if original else translation
         self.translation_history.append(entry)
@@ -696,18 +926,22 @@ class MainWindow(QMainWindow):
             if read_api_key_from_file() or self._check_api_key():
                 voice = self.gemini_voice_combo.currentText().strip() or "Leda"
                 instructions = self.gemini_instruction_edit.text().strip()
-                model = self.gemini_model_combo.currentData() or "gemini-2.5-flash-preview-tts"
-                temperature = self.gemini_temp_slider.value() / 100.0
-                thr = GeminiTTSThread(
-                    lines,
-                    read_api_key_from_file(),
-                    voice_name=voice,
-                    instruction=instructions,
-                    model_name=model,
-                    temperature=temperature,
-                )
-                thr.start()
-                self.tts_threads.append(thr)
+                model = self.gemini_model_combo.currentData()
+                if not model:
+                    self._log_console("[Gemini TTS unavailable: no allowed TTS model found]")
+                    self.gemini_tts_check.setChecked(False)
+                else:
+                    temperature = self.gemini_temp_slider.value() / 100.0
+                    thr = GeminiTTSThread(
+                        lines,
+                        read_api_key_from_file(),
+                        voice_name=voice,
+                        instruction=instructions,
+                        model_name=model,
+                        temperature=temperature,
+                    )
+                    thr.start()
+                    self.tts_threads.append(thr)
             else:
                 self.gemini_tts_check.setChecked(False)
 
@@ -1572,6 +1806,19 @@ class MainWindow(QMainWindow):
             else:
                 provider = 'openai'
 
+        if provider == 'gemini_loading':
+            QMessageBox.information(self, 'Gemini models', 'Gemini models are still being loaded.')
+            return
+        if provider == 'gemini_unavailable':
+            if self._check_api_key():
+                self.start_gemini_model_discovery()
+            QMessageBox.information(
+                self,
+                'Gemini models',
+                'No Gemini generateContent models are available yet. Try again after model discovery finishes.',
+            )
+            return
+
         if provider == 'gemini':
             if not GEMINI_AVAILABLE:
                 QMessageBox.warning(self, 'Gemini missing', 'google.genai not installed!'); return
@@ -1610,6 +1857,7 @@ class MainWindow(QMainWindow):
                     use_bbox_instead_of_polygons=self.bbox_only_check.isChecked(),
                     avoid_overlap=self.avoid_overlap_check.isChecked(),
                     font_offset=self.font_offset_spin.value(),
+                    background_opacity=self._overlay_background_alpha(),
                 )
             self.translation_overlay.translated_items.clear()
             for idx, det in enumerate(ordered):
@@ -1937,6 +2185,13 @@ class MainWindow(QMainWindow):
         debug_log(f"batch_mode enabled={enabled} max_size={self.batch_size_spin.value()}")
 
     @pyqtSlot(int)
+    def on_overlay_opacity_changed(self, value):
+        self.overlay_opacity_label.setText(f"Overlay opacity: {value}%")
+        if self.translation_overlay:
+            self.translation_overlay.set_background_opacity(self._overlay_background_alpha())
+        debug_log(f"overlay_opacity percent={value} alpha={self._overlay_background_alpha()}")
+
+    @pyqtSlot(int)
     def on_chatterbox_tts_toggle(self, _):
         enabled = self.chatterbox_tts_check.isChecked()
         self.chatterbox_voice_combo.setEnabled(enabled)
@@ -2031,6 +2286,8 @@ class MainWindow(QMainWindow):
         self._stop_auto_area_worker()
         if self.lmstudio_discovery_thread and self.lmstudio_discovery_thread.isRunning():
             self.lmstudio_discovery_thread.wait(100)
+        if self.gemini_model_discovery_thread and self.gemini_model_discovery_thread.isRunning():
+            self.gemini_model_discovery_thread.wait(100)
         if self.region_select_overlay:
             self.region_select_overlay.close()
             self.region_select_overlay = None

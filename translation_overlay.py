@@ -56,7 +56,7 @@ class TranslationOverlay(QWidget):
 
     def __init__(self, region_logical, capture_w, capture_h, expand_margin=0,
                  use_bbox_instead_of_polygons=False, avoid_overlap=False,
-                 font_offset=0):
+                 font_offset=0, background_opacity=180):
         super().__init__()
         self.region_logical = region_logical
         self.dpr = region_logical["dpr"]
@@ -66,6 +66,7 @@ class TranslationOverlay(QWidget):
         self.use_bbox_instead_of_polygons = use_bbox_instead_of_polygons
         self.avoid_overlap = avoid_overlap
         self.font_offset = font_offset
+        self.background_opacity = max(0, min(255, int(background_opacity)))
         self.translated_items = []
 
         self.setWindowFlags(
@@ -97,6 +98,10 @@ class TranslationOverlay(QWidget):
             if item["id"] == det_id:
                 item["text"] = new_text.strip()
                 break
+        self.update()
+
+    def set_background_opacity(self, opacity):
+        self.background_opacity = max(0, min(255, int(opacity)))
         self.update()
 
     def paintEvent(self, _):
@@ -160,7 +165,7 @@ class TranslationOverlay(QWidget):
 
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        text_bg = QColor(0, 0, 0, 180)
+        text_bg = QColor(0, 0, 0, self.background_opacity)
         draw_items = []
         for itm in self.translated_items:
             if not itm.get("text", "").strip():
